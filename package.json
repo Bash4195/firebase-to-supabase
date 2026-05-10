@@ -1,20 +1,36 @@
 {
   "name": "firebase-to-supabase",
   "version": "1.0.0",
-  "description": "Migrate a firebase project to supabase project",
-  "main": "index.ts",
-  "scripts": {
-    "run": "ts-node index.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "description": "firebase-to-supabase",
+  "homepage": "https://github.com/Bash4195/firebase-to-supabase#readme",
+  "bugs": {
+    "url": "https://github.com/Bash4195/firebase-to-supabase/issues"
   },
-  "author": "Mark Burggraf <mark@supabase.io>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bash4195/firebase-to-supabase.git"
+  },
   "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "firebase:auth:export:dev": "firebase auth:export ./auth/users-dev.json --format=json --project dev-flavorish",
+    "firebase:auth:export:staging": "firebase auth:export ./auth/users-staging.json --format=json --project staging-flavorish",
+    "firebase:auth:export:production": "firebase auth:export ./auth/users-production.json --format=json --project production-flavorish",
+    "backfill:auth:dev": "env-cmd -f .env.development npx ts-node ./auth/import_users.ts ./auth/users-dev.json 20",
+    "backfill:auth:staging": "env-cmd -f .env.staging npx ts-node ./auth/import_users.ts ./auth/users-staging.json 20",
+    "backfill:auth:production": "env-cmd -f .env.production npx ts-node ./auth/import_users.ts ./auth/users-production.json 20"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.2"
+  },
   "dependencies": {
-    "@supabase/supabase-js": "^1.30.7",
-    "firebase-admin": "^10.0.2",
-    "firebase-scrypt": "^2.1.0",
-    "moment": "^2.29.1",
-    "pg": "^8.7.1",
-    "stream-json": "^1.7.3"
+    "@supabase/supabase-js": "^2.105.4",
+    "@types/uuid": "^10.0.0",
+    "env-cmd": "^11.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3",
+    "uuid": "^14.0.0"
   }
 }

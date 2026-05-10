@@ -1,1 +1,0 @@
-# Firebase to Supabase: Migrating Functions

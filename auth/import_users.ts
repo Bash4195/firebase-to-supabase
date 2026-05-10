@@ -1,300 +1,358 @@
+// TODO: As part of the migration, we will need to update things that used the user id as the source of truth
+//  Stripe, RevenueCat, Sentry, etc.
+
 import * as fs from 'fs';
-import * as moment from 'moment';
-import { Client } from 'pg';
-import * as StreamArray from 'stream-json/streamers/StreamArray';
+import * as path from 'path';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
+import { firebaseUidToUuid } from '../helpers/firebaseUidToUuid';
+
+// --- Configuration ---
+const SUPABASE_URL = process.env.SUPABASE_URL!;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+
+const FIREBASE_HASH_CONFIG = {
+  mem_cost: process.env.FB_MEM_COST || '14',
+  rounds: process.env.FB_ROUNDS || '8',
+  salt_separator: process.env.FB_SALT_SEPARATOR || '',
+  signer_key: process.env.FB_SIGNER_KEY || '',
+};
+
+// --- Validate config ---
+if(!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('ERROR: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in .env');
+  process.exit(1);
+}
+if(!FIREBASE_HASH_CONFIG.salt_separator || !FIREBASE_HASH_CONFIG.signer_key) {
+  console.error('ERROR: FB_SALT_SEPARATOR and FB_SIGNER_KEY must be set in .env');
+  process.exit(1);
+}
+
+// --- CLI Args ---
 const args = process.argv.slice(2);
-let filename;
-let client: Client;
+const INPUT_FILE = args[0];
+const BATCH_SIZE = parseInt(args[1], 10) || 20;
 
-if (args.length < 1) {
-    console.log('Usage: node import_users.js <path_to_json_file> [<batch_size>]');
-    console.log('  path_to_json_file: full local path and filename of .json input file (of users)');
-    console.log('  batch_size: number of users to process in a batch (defaults to 100)');
+if(!INPUT_FILE) {
+  console.log('Usage: npx ts-node import_users.ts <path_to_json_file> [<batch_size>]');
+  console.log('');
+  console.log('  path_to_json_file  Path to the firebase auth:export JSON file');
+  console.log('  batch_size         Users per batch (default: 20)');
+  process.exit(1);
+}
+
+// --- Supabase Client ---
+const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: {
+    autoRefreshToken: false,
+    persistSession: false,
+  },
+});
+
+// --- Types ---
+interface FirebaseUser {
+  localId: string;
+  email?: string;
+  emailVerified?: boolean;
+  displayName?: string;
+  photoUrl?: string;
+  phoneNumber?: string;
+  passwordHash?: string;
+  salt?: string;
+  createdAt?: string; // milliseconds timestamp as string
+  lastSignedInAt?: string; // milliseconds timestamp as string
+  providerUserInfo?: {
+    providerId: string;
+    federatedId?: string;
+    email?: string;
+    rawId?: string;
+  }[];
+}
+
+interface MigrationResult {
+  total: number;
+  success: number;
+  skipped: number;
+  failed: number;
+  errors: { localId: string; email: string; error: string }[];
+}
+
+// --- Helpers ---
+
+/**
+ * Convert URL-safe base64 to standard base64.
+ * Firebase may use - and _ instead of + and /
+ */
+function urlSafeBase64ToStandard(str: string): string {
+  return str.replace(/-/g, '+').replace(/_/g, '/');
+}
+
+/**
+ * Constructs the $fbscrypt$ hash string for Supabase's encrypted_password field.
+ *
+ * Format: $fbscrypt$v=1,n=<mem_cost>,r=<rounds>,p=1,ss=<salt_separator>,sk=<signer_key>$<salt>$<hash>
+ */
+function formatFbScryptHash(passwordHash: string, salt: string): string {
+  const standardHash = urlSafeBase64ToStandard(passwordHash);
+  const standardSalt = urlSafeBase64ToStandard(salt);
+
+  const params = [
+    `v=1`,
+    `n=${FIREBASE_HASH_CONFIG.mem_cost}`,
+    `r=${FIREBASE_HASH_CONFIG.rounds}`,
+    `p=1`,
+    `ss=${FIREBASE_HASH_CONFIG.salt_separator}`,
+    `sk=${FIREBASE_HASH_CONFIG.signer_key}`,
+  ].join(',');
+
+  return `$fbscrypt$${params}$${standardSalt}$${standardHash}`;
+}
+
+/**
+ * Determine the provider(s) for a Firebase user based on providerUserInfo
+ */
+function getProviders(user: FirebaseUser): string[] {
+  const providers: string[] = [];
+  const providerData = user.providerUserInfo || [];
+
+  for(const p of providerData) {
+    const providerId = p.providerId?.toLowerCase().replace('.com', '');
+    switch(providerId) {
+      case 'password':
+        providers.push('email');
+        break;
+      case 'google':
+        providers.push('google');
+        break;
+      case 'apple':
+        providers.push('apple');
+        break;
+      default:
+        if(providerId) providers.push(providerId);
+    }
+  }
+
+  // If providerUserInfo is empty but user has a passwordHash, they're an email/password user
+  if(providers.length === 0 && user.passwordHash) {
+    providers.push('email');
+  }
+
+  // Fallback
+  if(providers.length === 0) {
+    providers.push('email');
+  }
+
+  return providers;
+}
+
+/**
+ * Check if user has an email/password-based account
+ */
+function hasPasswordAuth(user: FirebaseUser): boolean {
+  // Has a password hash = has password auth
+  if(user.passwordHash && user.salt) return true;
+
+  // Explicit password provider in providerUserInfo
+  const providerData = user.providerUserInfo || [];
+  return providerData.some((p) => p.providerId === 'password');
+}
+
+/**
+ * Convert millisecond timestamp string to ISO date string
+ */
+function msToISOString(ms?: string): string | undefined {
+  if(!ms) return undefined;
+  const num = parseInt(ms, 10);
+  if(isNaN(num)) return undefined;
+  return new Date(num).toISOString();
+}
+
+/**
+ * Sleep helper
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// --- Migration Logic ---
+
+async function migrateUser(
+  user: FirebaseUser
+): Promise<{ success: boolean; skipped: boolean; error?: string }> {
+  if(!user.email) {
+    return { success: false, skipped: true, error: 'No email address' };
+  }
+
+  // Build the password hash if user has password auth
+  let passwordHash: string | undefined;
+  if(hasPasswordAuth(user) && user.passwordHash && user.salt) {
+    passwordHash = formatFbScryptHash(user.passwordHash, user.salt);
+  }
+
+  const providers = getProviders(user);
+
+  console.log(user.createdAt)
+  console.log(msToISOString(user.createdAt))
+
+  try {
+    const createParams: any = {
+      // We can't reuse the same user id from firebase, but we can
+      id: firebaseUidToUuid(user.localId),
+      email: user.email,
+      // TODO: All email auth users in firebase haven't verified their email. We need to either set this to true or we need to show a prompt to verify their email when they sign in to firebase.
+      email_confirm: user.emailVerified || false,
+      // TODO: These dates aren't working.
+      created_at: msToISOString(user.createdAt),
+      last_sign_in_at: msToISOString(user.lastSignedInAt),
+      user_metadata: {
+        ...(user.displayName && { full_name: user.displayName }),
+        ...(user.photoUrl && { avatar_url: user.photoUrl }),
+        firebase_uid: user.localId, // Keep original for reference
+      },
+      app_metadata: {
+        provider: providers[0],
+        providers: providers,
+      },
+    };
+
+    // Include the password hash if available
+    if(passwordHash) {
+      createParams.password_hash = passwordHash;
+    }
+
+    // Include phone if available
+    if(user.phoneNumber) {
+      createParams.phone = user.phoneNumber;
+      createParams.phone_confirm = true;
+    }
+
+    const { data, error } = await supabase.auth.admin.createUser(createParams);
+
+    if(error) {
+      if(
+        error.message?.includes('already been registered') ||
+        error.message?.includes('already exists') ||
+        error.message?.includes('duplicate')
+      ) {
+        return { success: false, skipped: true, error: 'Already exists in Supabase' };
+      }
+      return { success: false, skipped: false, error: error.message };
+    }
+
+    return { success: true, skipped: false };
+  } catch(err: any) {
+    return { success: false, skipped: false, error: err.message || String(err) };
+  }
+}
+
+async function main() {
+  console.log('========================================');
+  console.log(' Firebase → Supabase Auth Migration');
+  console.log('========================================');
+  console.log(`Input file:  ${INPUT_FILE}`);
+  console.log(`Batch size:  ${BATCH_SIZE}`);
+  console.log(`Supabase:    ${SUPABASE_URL}`);
+  console.log('');
+
+  // Read and parse the file
+  if(!fs.existsSync(INPUT_FILE)) {
+    console.error(`ERROR: File not found: ${INPUT_FILE}`);
     process.exit(1);
-} else {
-    filename = args[0];
-}
-const BATCH_SIZE = parseInt(args[1],10) || 100;
-if (!BATCH_SIZE || typeof BATCH_SIZE !== 'number' || BATCH_SIZE < 1) {
-    console.log('invalid batch_size');
+  }
+
+  const raw = fs.readFileSync(INPUT_FILE, 'utf8');
+  const parsed = JSON.parse(raw);
+
+  // Handle both { "users": [...] } and plain array [...]
+  const users: FirebaseUser[] = Array.isArray(parsed) ? parsed : parsed.users;
+
+  if(!users || !Array.isArray(users)) {
+    console.error('ERROR: Could not find users array in JSON file.');
+    console.error('Expected format: { "users": [...] } or [...]');
     process.exit(1);
-}
+  }
 
-let pgCreds;
-try {
-    pgCreds = JSON.parse(fs.readFileSync('./supabase-service.json', 'utf8'));
-    if (typeof pgCreds.user === 'string' &&
-        typeof pgCreds.password === 'string' &&
-        typeof pgCreds.host === 'string' &&
-        typeof pgCreds.port === 'number' &&
-        typeof pgCreds.database === 'string') {} else {
-            console.log('supabase-service.json must contain the following fields:');
-            console.log('   user: string');
-            console.log('   password: string');
-            console.log('   host: string');
-            console.log('   port: number');
-            console.log('   database: string');
-            process.exit(1);
-        }
-} catch (err) {
-    console.log('error reading supabase-service.json', err);
-    process.exit(1);
-}
+  console.log(`Found ${users.length} users to process`);
+  console.log('');
 
-async function main(filename: string) {
-    client = await new Client({
-        user: pgCreds.user,
-        host: pgCreds.host,
-        database: pgCreds.database,
-        password: pgCreds.password,
-        port: pgCreds.port
-      });
-    client.connect();
+  const totals: MigrationResult = {
+    total: users.length,
+    success: 0,
+    skipped: 0,
+    failed: 0,
+    errors: [],
+  };
 
-    console.log(`loading users from ${filename}`);
-    await loadUsers(filename);
-    console.log(`done processing ${filename}`);
-    quit();
-}
-function quit() {
-    client.end();
-    process.exit(1);
-}
+  const startTime = Date.now();
 
-async function loadUsers(filename: string): Promise<any> {
-    return new Promise((resolve, reject) => {
-        const Batch = require('stream-json/utils/Batch');
-        let insertRows = [];
+  for(let i = 0; i < users.length; i += BATCH_SIZE) {
+    const batch = users.slice(i, i + BATCH_SIZE);
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(users.length / BATCH_SIZE);
 
-        const StreamArray = require('stream-json/streamers/StreamArray');
-        const {chain} = require('stream-chain');
-        const fs = require('fs');
-        
-        const pipeline = chain([
-          fs.createReadStream(filename),
-          StreamArray.withParser(),
-          new Batch({batchSize: BATCH_SIZE})
-        ]);
-        
-        // count all odd values from a huge array
-        
-        let oddCounter = 0;
-        pipeline.on('data', async data => {
-          data.forEach(item => {
-            // console.log('user', user);
-            const index = item.key;
-            const user = item.value;
-            insertRows.push(createUser(user));
-          });
-          console.log('insertUsers:', insertRows.length);
-          pipeline.pause();
-          const result = await insertUsers(insertRows);
-          insertRows = [];
-          pipeline.resume();
+    process.stdout.write(`Batch ${batchNum}/${totalBatches} (users ${i + 1}-${i + batch.length})... `);
+
+    let batchSuccess = 0;
+    let batchSkipped = 0;
+    let batchFailed = 0;
+
+    for(const user of batch) {
+      const result = await migrateUser(user);
+
+      if(result.success) {
+        totals.success++;
+        batchSuccess++;
+      } else if(result.skipped) {
+        totals.skipped++;
+        batchSkipped++;
+      } else {
+        totals.failed++;
+        batchFailed++;
+        totals.errors.push({
+          localId: user.localId,
+          email: user.email || 'unknown',
+          error: result.error || 'Unknown error',
         });
-        pipeline.on('end', () => {
-            console.log('finished');
-            resolve('');
-        });
-    
-    });    
-}
+      }
 
-async function loadUsers_old(filename: string): Promise<any> {
-    return new Promise((resolve, reject) => {
-        let insertRows = [];
-        const jsonStream = StreamArray.withParser();
-        //internal Node readable stream option, pipe to stream-json to convert it for us
-        fs.createReadStream(filename).pipe(jsonStream.input);
-    
-        fs.writeFileSync(`./queue.tmp`, '', 'utf-8');       
+      // Delay between individual requests to avoid rate limits
+      await sleep(50);
+    }
 
-        //You'll get json objects here
-        //Key is the array-index here
-        jsonStream.on('data', async ({key, value}) => {
-            console.log('on data', key);
-            const index = key;
-            const user = value;
-            insertRows.push(createUser(user));
-            fs.appendFileSync(`./queue.tmp`, createUser(user) + '\n', 'utf-8');       
-            console.log('insertRows.length', insertRows.length);
-            if (insertRows.length >= 10) {
-                console.log('calling insertUsers');
-                //const result = await insertUsers(insertRows);
-                //console.log('insertUsers result', result);
-                //quit();
-                //insertRows = [];
-            }
+    console.log(`✓ ${batchSuccess} | ⊘ ${batchSkipped} | ✗ ${batchFailed}`);
 
-        });
+    // Small delay between batches
+    await sleep(200);
+  }
 
-        jsonStream.on('error', (err) => {
-            console.log('loadUsers error', err);
-            quit();
-        });
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
-        jsonStream.on('end', async () => {
-            console.log('loadUsers end...');
-            if (insertRows.length > 0) {
-                const result = await insertUsers(insertRows);
-                console.log('insertUsers result', result);
-                insertRows = [];
-                resolve('done');
-            }
-        });
+  console.log('');
+  console.log('========================================');
+  console.log(' Migration Complete');
+  console.log('========================================');
+  console.log(`Total processed: ${totals.total}`);
+  console.log(`  ✓ Migrated:   ${totals.success}`);
+  console.log(`  ⊘ Skipped:    ${totals.skipped}`);
+  console.log(`  ✗ Failed:     ${totals.failed}`);
+  console.log(`Time elapsed:   ${elapsed}s`);
+  console.log('');
+
+  if(totals.errors.length > 0) {
+    const errorFile = path.join(path.dirname(INPUT_FILE), 'migration_errors.json');
+    fs.writeFileSync(errorFile, JSON.stringify(totals.errors, null, 2));
+    console.log(`Errors written to: ${errorFile}`);
+
+    // Show first few errors
+    console.log('');
+    console.log('First 5 errors:');
+    totals.errors.slice(0, 5).forEach((e) => {
+      console.log(`  ${e.email} (${e.localId}): ${e.error}`);
     });
-
+  }
 }
 
-async function insertUsers(rows: any[]): Promise<any> {
-    const sql = createUserHeader() + rows.join(',\n') + 'ON CONFLICT DO NOTHING;';
-    // console.log('sql', sql);
-    const result = await runSQL(sql);
-    return result;   
-}
-
-function formatDate(date: string) {
-    return moment.utc(date).toISOString();
-}
-async function runSQL(sql: string): Promise<any> {
-    return new Promise(async (resolve, reject) => {
-        // fs.writeFileSync(`temp.sql`, sql, 'utf-8');
-        client.query(sql, (err, res) => {
-            if (err) {
-                console.log('runSQL error:', err);
-                console.log('sql was: ');
-                console.log(sql);
-                quit();
-                reject(err);
-            } else {
-                resolve(res);
-            }
-        });     
-    });
-}
-
-function jsToSqlType(type: string) {
-    switch (type) {
-        case 'string':
-            return 'text';
-        case 'number':
-            return 'numeric';
-        case 'boolean':
-            return 'boolean';
-        case 'object':
-            return 'jsonb';
-        case 'array':
-            return 'jsonb';
-        default:
-            return 'text';
-    }
-}
-function getKeyType(primary_key_strategy: string) {
-    switch (primary_key_strategy) {
-        case 'none':
-            return '';
-        case 'serial':
-            return 'integer';
-        case 'smallserial':
-            return 'smallint';
-        case 'bigserial':
-            return 'bigint';
-        case 'uuid':
-            return 'uuid';
-        case 'firestore_id':
-            return 'text';
-        default:
-            return '';
-    }
-}
-
-main(filename);
-
-function createUserHeader() {
-    return `INSERT INTO auth.users (
-        instance_id,
-        id,
-        aud,
-        role,
-        email,
-        encrypted_password,
-        email_confirmed_at,
-        invited_at,
-        confirmation_token,
-        confirmation_sent_at,
-        recovery_token,
-        recovery_sent_at,
-        email_change_token_new,
-        email_change,
-        email_change_sent_at,
-        last_sign_in_at,
-        raw_app_meta_data,
-        raw_user_meta_data,
-        is_super_admin,
-        created_at,
-        updated_at,
-        phone,
-        phone_confirmed_at,
-        phone_change,
-        phone_change_token,
-        phone_change_sent_at,
-        email_change_token_current,
-        email_change_confirm_status    
-    ) VALUES `;
-}
-function createUser(user: any) {
-    const sql = `(
-        '00000000-0000-0000-0000-000000000000', /* instance_id */
-        uuid_generate_v4(), /* id */
-        'authenticated', /* aud character varying(255),*/
-        'authenticated', /* role character varying(255),*/
-        '${user.email}', /* email character varying(255),*/
-        '', /* encrypted_password character varying(255),*/
-        ${user.emailVerified ? 'NOW()' : 'null'}, /* email_confirmed_at timestamp with time zone,*/
-        '${formatDate(user.metadata.creationTime)}', /* invited_at timestamp with time zone, */
-        '', /* confirmation_token character varying(255), */
-        null, /* confirmation_sent_at timestamp with time zone, */
-        '', /* recovery_token character varying(255), */
-        null, /* recovery_sent_at timestamp with time zone, */
-        '', /* email_change_token_new character varying(255), */
-        '', /* email_change character varying(255), */
-        null, /* email_change_sent_at timestamp with time zone, */
-        null, /* last_sign_in_at timestamp with time zone, */
-        '${getProviderString(user.providerData)}', /* raw_app_meta_data jsonb,*/
-        '{"fbuser":${JSON.stringify(user)}}', /* raw_user_meta_data jsonb,*/
-        false, /* is_super_admin boolean, */
-        NOW(), /* created_at timestamp with time zone, */
-        NOW(), /* updated_at timestamp with time zone, */
-        null, /* phone character varying(15) DEFAULT NULL::character varying, */
-        null, /* phone_confirmed_at timestamp with time zone, */
-        '', /* phone_change character varying(15) DEFAULT ''::character varying, */
-        '', /* phone_change_token character varying(255) DEFAULT ''::character varying, */
-        null, /* phone_change_sent_at timestamp with time zone, */
-        '', /* email_change_token_current character varying(255) DEFAULT ''::character varying, */
-        0 /*email_change_confirm_status smallint DEFAULT 0 */   
-    )`;
-    return sql;
-}
-
-function getProviderString(providerData: any[]) {
-    const providers = [];
-    for (let i = 0; i < providerData.length; i++) {
-        const p = providerData[i].providerId.toLowerCase().replace('.com', '');
-        let provider = 'email';
-        switch (p) {
-            case 'password':
-                provider = 'email';
-                break;
-            case 'google':
-                provider = 'google';
-                break;
-            case 'facebook':
-                provider = 'facebook';
-                break;
-        }
-        providers.push(provider);
-    }
-    const providerString = `{"provider": "${providers[0]}","providers":["${providers.join('","')}"]}`;
-    return providerString;
-}
+main().catch((err) => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});

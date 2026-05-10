@@ -204,7 +204,6 @@ async function migrateUser(
       // We can't reuse the same user id from firebase, but we can
       id: firebaseUidToUuid(user.localId),
       email: user.email,
-      // TODO: All email auth users in firebase haven't verified their email. We need to either set this to true or we need to show a prompt to verify their email when they sign in to firebase.
       email_confirm: user.emailVerified || false,
       user_metadata: {
         ...(user.displayName && { full_name: user.displayName }),

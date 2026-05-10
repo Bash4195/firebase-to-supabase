@@ -1,44 +1,52 @@
 // TODO: As part of the migration, we will need to update things that used the user id as the source of truth
 //  Stripe, RevenueCat, Sentry, etc.
 
-import * as fs from 'fs';
-import * as path from 'path';
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import * as fs from "fs"
+import * as path from "path"
+import { Client } from "pg"
+import { createClient, SupabaseClient } from "@supabase/supabase-js"
 
-import { firebaseUidToUuid } from '../helpers/firebaseUidToUuid';
+import { firebaseUidToUuid } from "../helpers/firebaseUidToUuid"
 
 // --- Configuration ---
-const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const SUPABASE_URL = process.env.SUPABASE_URL!
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!
+const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL!
+
+let pgClient: Client
 
 const FIREBASE_HASH_CONFIG = {
-  mem_cost: process.env.FB_MEM_COST || '14',
-  rounds: process.env.FB_ROUNDS || '8',
-  salt_separator: process.env.FB_SALT_SEPARATOR || '',
-  signer_key: process.env.FB_SIGNER_KEY || '',
-};
+  mem_cost: process.env.FB_MEM_COST || "14",
+  rounds: process.env.FB_ROUNDS || "8",
+  salt_separator: process.env.FB_SALT_SEPARATOR || "",
+  signer_key: process.env.FB_SIGNER_KEY || "",
+}
 
 // --- Validate config ---
-if(!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('ERROR: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in .env');
-  process.exit(1);
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("ERROR: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in .env")
+  process.exit(1)
 }
-if(!FIREBASE_HASH_CONFIG.salt_separator || !FIREBASE_HASH_CONFIG.signer_key) {
-  console.error('ERROR: FB_SALT_SEPARATOR and FB_SIGNER_KEY must be set in .env');
-  process.exit(1);
+if (!FIREBASE_HASH_CONFIG.salt_separator || !FIREBASE_HASH_CONFIG.signer_key) {
+  console.error("ERROR: FB_SALT_SEPARATOR and FB_SIGNER_KEY must be set in .env")
+  process.exit(1)
+}
+if (!SUPABASE_DB_URL) {
+  console.error("ERROR: SUPABASE_DB_URL must be set in .env")
+  process.exit(1)
 }
 
 // --- CLI Args ---
-const args = process.argv.slice(2);
-const INPUT_FILE = args[0];
-const BATCH_SIZE = parseInt(args[1], 10) || 20;
+const args = process.argv.slice(2)
+const INPUT_FILE = args[0]
+const BATCH_SIZE = parseInt(args[1], 10) || 20
 
-if(!INPUT_FILE) {
-  console.log('Usage: npx ts-node import_users.ts <path_to_json_file> [<batch_size>]');
-  console.log('');
-  console.log('  path_to_json_file  Path to the firebase auth:export JSON file');
-  console.log('  batch_size         Users per batch (default: 20)');
-  process.exit(1);
+if (!INPUT_FILE) {
+  console.log("Usage: npx ts-node import_users.ts <path_to_json_file> [<batch_size>]")
+  console.log("")
+  console.log("  path_to_json_file  Path to the firebase auth:export JSON file")
+  console.log("  batch_size         Users per batch (default: 20)")
+  process.exit(1)
 }
 
 // --- Supabase Client ---
@@ -47,34 +55,34 @@ const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROL
     autoRefreshToken: false,
     persistSession: false,
   },
-});
+})
 
 // --- Types ---
 interface FirebaseUser {
-  localId: string;
-  email?: string;
-  emailVerified?: boolean;
-  displayName?: string;
-  photoUrl?: string;
-  phoneNumber?: string;
-  passwordHash?: string;
-  salt?: string;
-  createdAt?: string; // milliseconds timestamp as string
-  lastSignedInAt?: string; // milliseconds timestamp as string
+  localId: string
+  email?: string
+  emailVerified?: boolean
+  displayName?: string
+  photoUrl?: string
+  phoneNumber?: string
+  passwordHash?: string
+  salt?: string
+  createdAt?: string // milliseconds timestamp as string
+  lastSignedInAt?: string // milliseconds timestamp as string
   providerUserInfo?: {
-    providerId: string;
-    federatedId?: string;
-    email?: string;
-    rawId?: string;
-  }[];
+    providerId: string
+    federatedId?: string
+    email?: string
+    rawId?: string
+  }[]
 }
 
 interface MigrationResult {
-  total: number;
-  success: number;
-  skipped: number;
-  failed: number;
-  errors: { localId: string; email: string; error: string }[];
+  total: number
+  success: number
+  skipped: number
+  failed: number
+  errors: { localId: string; email: string; error: string }[]
 }
 
 // --- Helpers ---
@@ -84,7 +92,7 @@ interface MigrationResult {
  * Firebase may use - and _ instead of + and /
  */
 function urlSafeBase64ToStandard(str: string): string {
-  return str.replace(/-/g, '+').replace(/_/g, '/');
+  return str.replace(/-/g, "+").replace(/_/g, "/")
 }
 
 /**
@@ -93,8 +101,8 @@ function urlSafeBase64ToStandard(str: string): string {
  * Format: $fbscrypt$v=1,n=<mem_cost>,r=<rounds>,p=1,ss=<salt_separator>,sk=<signer_key>$<salt>$<hash>
  */
 function formatFbScryptHash(passwordHash: string, salt: string): string {
-  const standardHash = urlSafeBase64ToStandard(passwordHash);
-  const standardSalt = urlSafeBase64ToStandard(salt);
+  const standardHash = urlSafeBase64ToStandard(passwordHash)
+  const standardSalt = urlSafeBase64ToStandard(salt)
 
   const params = [
     `v=1`,
@@ -103,46 +111,46 @@ function formatFbScryptHash(passwordHash: string, salt: string): string {
     `p=1`,
     `ss=${FIREBASE_HASH_CONFIG.salt_separator}`,
     `sk=${FIREBASE_HASH_CONFIG.signer_key}`,
-  ].join(',');
+  ].join(",")
 
-  return `$fbscrypt$${params}$${standardSalt}$${standardHash}`;
+  return `$fbscrypt$${params}$${standardSalt}$${standardHash}`
 }
 
 /**
  * Determine the provider(s) for a Firebase user based on providerUserInfo
  */
 function getProviders(user: FirebaseUser): string[] {
-  const providers: string[] = [];
-  const providerData = user.providerUserInfo || [];
+  const providers: string[] = []
+  const providerData = user.providerUserInfo || []
 
-  for(const p of providerData) {
-    const providerId = p.providerId?.toLowerCase().replace('.com', '');
-    switch(providerId) {
-      case 'password':
-        providers.push('email');
-        break;
-      case 'google':
-        providers.push('google');
-        break;
-      case 'apple':
-        providers.push('apple');
-        break;
+  for (const p of providerData) {
+    const providerId = p.providerId?.toLowerCase().replace(".com", "")
+    switch (providerId) {
+      case "password":
+        providers.push("email")
+        break
+      case "google":
+        providers.push("google")
+        break
+      case "apple":
+        providers.push("apple")
+        break
       default:
-        if(providerId) providers.push(providerId);
+        if (providerId) providers.push(providerId)
     }
   }
 
   // If providerUserInfo is empty but user has a passwordHash, they're an email/password user
-  if(providers.length === 0 && user.passwordHash) {
-    providers.push('email');
+  if (providers.length === 0 && user.passwordHash) {
+    providers.push("email")
   }
 
   // Fallback
-  if(providers.length === 0) {
-    providers.push('email');
+  if (providers.length === 0) {
+    providers.push("email")
   }
 
-  return providers;
+  return providers
 }
 
 /**
@@ -150,49 +158,46 @@ function getProviders(user: FirebaseUser): string[] {
  */
 function hasPasswordAuth(user: FirebaseUser): boolean {
   // Has a password hash = has password auth
-  if(user.passwordHash && user.salt) return true;
+  if (user.passwordHash && user.salt) return true
 
   // Explicit password provider in providerUserInfo
-  const providerData = user.providerUserInfo || [];
-  return providerData.some((p) => p.providerId === 'password');
+  const providerData = user.providerUserInfo || []
+  return providerData.some((p) => p.providerId === "password")
 }
 
 /**
  * Convert millisecond timestamp string to ISO date string
  */
-function msToISOString(ms?: string): string | undefined {
-  if(!ms) return undefined;
-  const num = parseInt(ms, 10);
-  if(isNaN(num)) return undefined;
-  return new Date(num).toISOString();
+function msToISOString(ms?: string): string | null {
+  if (!ms) return null
+  const num = parseInt(ms, 10)
+  if (isNaN(num)) return null
+  return new Date(num).toISOString()
 }
 
 /**
  * Sleep helper
  */
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 // --- Migration Logic ---
 
 async function migrateUser(
   user: FirebaseUser
-): Promise<{ success: boolean; skipped: boolean; error?: string }> {
-  if(!user.email) {
-    return { success: false, skipped: true, error: 'No email address' };
+): Promise<{ success: boolean; skipped: boolean; supabaseId?: string; error?: string }> {
+  if (!user.email) {
+    return { success: false, skipped: true, error: "No email address" }
   }
 
   // Build the password hash if user has password auth
-  let passwordHash: string | undefined;
-  if(hasPasswordAuth(user) && user.passwordHash && user.salt) {
-    passwordHash = formatFbScryptHash(user.passwordHash, user.salt);
+  let passwordHash: string | undefined
+  if (hasPasswordAuth(user) && user.passwordHash && user.salt) {
+    passwordHash = formatFbScryptHash(user.passwordHash, user.salt)
   }
 
-  const providers = getProviders(user);
-
-  console.log(user.createdAt)
-  console.log(msToISOString(user.createdAt))
+  const providers = getProviders(user)
 
   try {
     const createParams: any = {
@@ -201,9 +206,6 @@ async function migrateUser(
       email: user.email,
       // TODO: All email auth users in firebase haven't verified their email. We need to either set this to true or we need to show a prompt to verify their email when they sign in to firebase.
       email_confirm: user.emailVerified || false,
-      // TODO: These dates aren't working.
-      created_at: msToISOString(user.createdAt),
-      last_sign_in_at: msToISOString(user.lastSignedInAt),
       user_metadata: {
         ...(user.displayName && { full_name: user.displayName }),
         ...(user.photoUrl && { avatar_url: user.photoUrl }),
@@ -213,67 +215,108 @@ async function migrateUser(
         provider: providers[0],
         providers: providers,
       },
-    };
+    }
 
     // Include the password hash if available
-    if(passwordHash) {
-      createParams.password_hash = passwordHash;
+    if (passwordHash) {
+      createParams.password_hash = passwordHash
     }
 
     // Include phone if available
-    if(user.phoneNumber) {
-      createParams.phone = user.phoneNumber;
-      createParams.phone_confirm = true;
+    if (user.phoneNumber) {
+      createParams.phone = user.phoneNumber
+      createParams.phone_confirm = true
     }
 
-    const { data, error } = await supabase.auth.admin.createUser(createParams);
+    const { data, error } = await supabase.auth.admin.createUser(createParams)
 
-    if(error) {
-      if(
-        error.message?.includes('already been registered') ||
-        error.message?.includes('already exists') ||
-        error.message?.includes('duplicate')
+    if (error) {
+      if (
+        error.message?.includes("already been registered") ||
+        error.message?.includes("already exists") ||
+        error.message?.includes("duplicate")
       ) {
-        return { success: false, skipped: true, error: 'Already exists in Supabase' };
+        return { success: false, skipped: true, error: "Already exists in Supabase" }
       }
-      return { success: false, skipped: false, error: error.message };
+      return { success: false, skipped: false, error: error.message }
     }
 
-    return { success: true, skipped: false };
-  } catch(err: any) {
-    return { success: false, skipped: false, error: err.message || String(err) };
+    return { success: true, skipped: false, supabaseId: data.user?.id }
+  } catch (err: any) {
+    return { success: false, skipped: false, error: err.message || String(err) }
+  }
+}
+
+/**
+ * Batch-update created_at and last_sign_in_at for migrated users via direct SQL.
+ */
+async function updateTimestamps(
+  updates: { supabaseId: string; createdAt: string | null; lastSignedInAt: string | null }[]
+): Promise<void> {
+  if (updates.length === 0) return
+
+  // Build a single UPDATE using a VALUES list
+  const valuesClauses = updates.map((u, i) => {
+    const id = u.supabaseId
+    const created = u.createdAt ? `'${u.createdAt}'::timestamptz` : "NULL"
+    const lastSignIn = u.lastSignedInAt ? `'${u.lastSignedInAt}'::timestamptz` : "NULL"
+    return `('${id}'::uuid, ${created}, ${lastSignIn})`
+  })
+
+  const sql = `
+    UPDATE auth.users AS u
+    SET
+      created_at = COALESCE(v.created_at, u.created_at),
+      last_sign_in_at = v.last_sign_in_at
+    FROM (VALUES ${valuesClauses.join(",\n")}) AS v(id, created_at, last_sign_in_at)
+    WHERE u.id = v.id;
+  `
+
+  try {
+    await pgClient.query(sql)
+  } catch (err: any) {
+    console.error("  ⚠ Failed to update timestamps:", err.message)
   }
 }
 
 async function main() {
-  console.log('========================================');
-  console.log(' Firebase → Supabase Auth Migration');
-  console.log('========================================');
-  console.log(`Input file:  ${INPUT_FILE}`);
-  console.log(`Batch size:  ${BATCH_SIZE}`);
-  console.log(`Supabase:    ${SUPABASE_URL}`);
-  console.log('');
+  console.log("========================================")
+  console.log(" Firebase → Supabase Auth Migration")
+  console.log("========================================")
+  console.log(`Input file:  ${INPUT_FILE}`)
+  console.log(`Batch size:  ${BATCH_SIZE}`)
+  console.log(`Supabase:    ${SUPABASE_URL}`)
+  console.log("")
 
   // Read and parse the file
-  if(!fs.existsSync(INPUT_FILE)) {
-    console.error(`ERROR: File not found: ${INPUT_FILE}`);
-    process.exit(1);
+  if (!fs.existsSync(INPUT_FILE)) {
+    console.error(`ERROR: File not found: ${INPUT_FILE}`)
+    process.exit(1)
   }
 
-  const raw = fs.readFileSync(INPUT_FILE, 'utf8');
-  const parsed = JSON.parse(raw);
+  const raw = fs.readFileSync(INPUT_FILE, "utf8")
+  const parsed = JSON.parse(raw)
 
   // Handle both { "users": [...] } and plain array [...]
-  const users: FirebaseUser[] = Array.isArray(parsed) ? parsed : parsed.users;
+  const users: FirebaseUser[] = Array.isArray(parsed) ? parsed : parsed.users
 
-  if(!users || !Array.isArray(users)) {
-    console.error('ERROR: Could not find users array in JSON file.');
-    console.error('Expected format: { "users": [...] } or [...]');
-    process.exit(1);
+  if (!users || !Array.isArray(users)) {
+    console.error("ERROR: Could not find users array in JSON file.")
+    console.error('Expected format: { "users": [...] } or [...]')
+    process.exit(1)
   }
 
-  console.log(`Found ${users.length} users to process`);
-  console.log('');
+  // Connect to Postgres for timestamp updates
+  pgClient = new Client({
+    connectionString: SUPABASE_DB_URL,
+    ssl: { rejectUnauthorized: false },
+  })
+  await pgClient.connect()
+  console.log("Connected to Supabase Postgres")
+  console.log("")
+
+  console.log(`Found ${users.length} users to process`)
+  console.log("")
 
   const totals: MigrationResult = {
     total: users.length,
@@ -281,78 +324,94 @@ async function main() {
     skipped: 0,
     failed: 0,
     errors: [],
-  };
+  }
 
-  const startTime = Date.now();
+  const startTime = Date.now()
 
-  for(let i = 0; i < users.length; i += BATCH_SIZE) {
-    const batch = users.slice(i, i + BATCH_SIZE);
-    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
-    const totalBatches = Math.ceil(users.length / BATCH_SIZE);
+  for (let i = 0; i < users.length; i += BATCH_SIZE) {
+    const batch = users.slice(i, i + BATCH_SIZE)
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1
+    const totalBatches = Math.ceil(users.length / BATCH_SIZE)
 
-    process.stdout.write(`Batch ${batchNum}/${totalBatches} (users ${i + 1}-${i + batch.length})... `);
+    process.stdout.write(`Batch ${batchNum}/${totalBatches} (users ${i + 1}-${i + batch.length})... `)
 
-    let batchSuccess = 0;
-    let batchSkipped = 0;
-    let batchFailed = 0;
+    let batchSuccess = 0
+    let batchSkipped = 0
+    let batchFailed = 0
+    const timestampUpdates: { supabaseId: string; createdAt: string | null; lastSignedInAt: string | null }[] = []
 
-    for(const user of batch) {
-      const result = await migrateUser(user);
+    for (const user of batch) {
+      const result = await migrateUser(user)
 
-      if(result.success) {
-        totals.success++;
-        batchSuccess++;
-      } else if(result.skipped) {
-        totals.skipped++;
-        batchSkipped++;
+      if (result.success) {
+        totals.success++
+        batchSuccess++
+
+        // Collect timestamp data for this user
+        if (result.supabaseId) {
+          timestampUpdates.push({
+            supabaseId: result.supabaseId,
+            createdAt: msToISOString(user.createdAt),
+            lastSignedInAt: msToISOString(user.lastSignedInAt),
+          })
+        }
+      } else if (result.skipped) {
+        totals.skipped++
+        batchSkipped++
       } else {
-        totals.failed++;
-        batchFailed++;
+        totals.failed++
+        batchFailed++
         totals.errors.push({
           localId: user.localId,
-          email: user.email || 'unknown',
-          error: result.error || 'Unknown error',
-        });
+          email: user.email || "unknown",
+          error: result.error || "Unknown error",
+        })
       }
 
       // Delay between individual requests to avoid rate limits
-      await sleep(50);
+      await sleep(50)
     }
 
-    console.log(`✓ ${batchSuccess} | ⊘ ${batchSkipped} | ✗ ${batchFailed}`);
+    // Batch-update timestamps for all successfully created users
+    await updateTimestamps(timestampUpdates)
+
+    console.log(`✓ ${batchSuccess} | ⊘ ${batchSkipped} | ✗ ${batchFailed}`)
 
     // Small delay between batches
-    await sleep(200);
+    await sleep(200)
   }
 
-  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  // Cleanup
+  await pgClient.end()
 
-  console.log('');
-  console.log('========================================');
-  console.log(' Migration Complete');
-  console.log('========================================');
-  console.log(`Total processed: ${totals.total}`);
-  console.log(`  ✓ Migrated:   ${totals.success}`);
-  console.log(`  ⊘ Skipped:    ${totals.skipped}`);
-  console.log(`  ✗ Failed:     ${totals.failed}`);
-  console.log(`Time elapsed:   ${elapsed}s`);
-  console.log('');
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
 
-  if(totals.errors.length > 0) {
-    const errorFile = path.join(path.dirname(INPUT_FILE), 'migration_errors.json');
-    fs.writeFileSync(errorFile, JSON.stringify(totals.errors, null, 2));
-    console.log(`Errors written to: ${errorFile}`);
+  console.log("")
+  console.log("========================================")
+  console.log(" Migration Complete")
+  console.log("========================================")
+  console.log(`Total processed: ${totals.total}`)
+  console.log(`  ✓ Migrated:   ${totals.success}`)
+  console.log(`  ⊘ Skipped:    ${totals.skipped}`)
+  console.log(`  ✗ Failed:     ${totals.failed}`)
+  console.log(`Time elapsed:   ${elapsed}s`)
+  console.log("")
+
+  if (totals.errors.length > 0) {
+    const errorFile = path.join(path.dirname(INPUT_FILE), "migration_errors.json")
+    fs.writeFileSync(errorFile, JSON.stringify(totals.errors, null, 2))
+    console.log(`Errors written to: ${errorFile}`)
 
     // Show first few errors
-    console.log('');
-    console.log('First 5 errors:');
+    console.log("")
+    console.log("First 5 errors:")
     totals.errors.slice(0, 5).forEach((e) => {
-      console.log(`  ${e.email} (${e.localId}): ${e.error}`);
-    });
+      console.log(`  ${e.email} (${e.localId}): ${e.error}`)
+    })
   }
 }
 
 main().catch((err) => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+  console.error("Fatal error:", err)
+  process.exit(1)
+})

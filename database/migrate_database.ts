@@ -115,8 +115,10 @@ function firestoreTimestampToDate(ts: any): string | null {
  */
 function escSql(val: string | null | undefined): string {
   if (val === null || val === undefined) return "NULL"
+  // Coerce to string in case a non-string value slips through
+  const str = typeof val === "string" ? val : String(val)
   // Escape single quotes by doubling them
-  return `'${val.replace(/'/g, "''")}'`
+  return `'${str.replace(/'/g, "''")}'`
 }
 
 /**
@@ -137,8 +139,27 @@ function sqlVal(val: any, type?: string): string {
     return `ARRAY[${elements}]::text[]`
   }
   if (type === "uuid") return `${escSql(val)}::uuid`
-  if (type === "timestamptz") return `${escSql(val)}::timestamptz`
-  if (type === "date") return `${escSql(val)}::date`
+  if (type === "timestamptz") {
+    // Handle Firestore Timestamp objects, numeric timestamps, and string dates
+    if (typeof val === "object") {
+      const iso = firestoreTimestampToISO(val)
+      if (!iso) return "NULL"
+      return `${escSql(iso)}::timestamptz`
+    }
+    const str = String(val)
+    if (!str || str === "undefined" || str === "null") return "NULL"
+    return `${escSql(str)}::timestamptz`
+  }
+  if (type === "date") {
+    if (typeof val === "object") {
+      const d = firestoreTimestampToDate(val)
+      if (!d) return "NULL"
+      return `${escSql(d)}::date`
+    }
+    const str = String(val)
+    if (!str || str === "undefined" || str === "null") return "NULL"
+    return `${escSql(str)}::date`
+  }
   if (type === "enum") return escSql(val)
   return escSql(String(val))
 }

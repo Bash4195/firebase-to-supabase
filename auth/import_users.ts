@@ -332,7 +332,7 @@ async function main() {
     const batchNum = Math.floor(i / BATCH_SIZE) + 1
     const totalBatches = Math.ceil(users.length / BATCH_SIZE)
 
-    process.stdout.write(`Batch ${batchNum}/${totalBatches} (users ${i + 1}-${i + batch.length})... `)
+    console.log(`Batch ${batchNum}/${totalBatches} (users ${i + 1}-${i + batch.length})... `)
 
     let batchSuccess = 0
     let batchSkipped = 0

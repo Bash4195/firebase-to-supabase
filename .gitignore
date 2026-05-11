@@ -5,3 +5,5 @@ node_modules
 .env.development
 .env.staging
 .env.production
+
+database/firebase-service-accounts

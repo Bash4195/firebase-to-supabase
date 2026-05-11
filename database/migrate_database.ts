@@ -50,33 +50,33 @@ let pgClient: Client
 interface MigrationCounters {
   profiles: { success: number; failed: number; errors: { id: string; error: string }[] }
   recipes: { success: number; failed: number; errors: { id: string; error: string }[] }
-  recipeIngredients: { success: number; failed: number }
-  recipeInstructions: { success: number; failed: number }
+  recipeIngredients: { success: number; failed: number; errors: { id: string; error: string }[] }
+  recipeInstructions: { success: number; failed: number; errors: { id: string; error: string }[] }
   collections: { success: number; failed: number; errors: { id: string; error: string }[] }
-  collectionRecipes: { success: number; failed: number; skipped: number }
-  collectionShares: { success: number; failed: number; skipped: number }
+  collectionRecipes: { success: number; failed: number; skipped: number; errors: { id: string; error: string }[] }
+  collectionShares: { success: number; failed: number; skipped: number; errors: { id: string; error: string }[] }
   lists: { success: number; failed: number; errors: { id: string; error: string }[] }
-  listItems: { success: number; failed: number }
-  listShares: { success: number; failed: number; skipped: number }
+  listItems: { success: number; failed: number; errors: { id: string; error: string }[] }
+  listShares: { success: number; failed: number; skipped: number; errors: { id: string; error: string }[] }
   mealPlans: { success: number; failed: number; errors: { id: string; error: string }[] }
-  mealPlanRecipes: { success: number; failed: number; skipped: number }
-  mealPlanShares: { success: number; failed: number; skipped: number }
+  mealPlanRecipes: { success: number; failed: number; skipped: number; errors: { id: string; error: string }[] }
+  mealPlanShares: { success: number; failed: number; skipped: number; errors: { id: string; error: string }[] }
 }
 
 const counters: MigrationCounters = {
   profiles: { success: 0, failed: 0, errors: [] },
   recipes: { success: 0, failed: 0, errors: [] },
-  recipeIngredients: { success: 0, failed: 0 },
-  recipeInstructions: { success: 0, failed: 0 },
+  recipeIngredients: { success: 0, failed: 0, errors: [] },
+  recipeInstructions: { success: 0, failed: 0, errors: [] },
   collections: { success: 0, failed: 0, errors: [] },
-  collectionRecipes: { success: 0, failed: 0, skipped: 0 },
-  collectionShares: { success: 0, failed: 0, skipped: 0 },
+  collectionRecipes: { success: 0, failed: 0, skipped: 0, errors: [] },
+  collectionShares: { success: 0, failed: 0, skipped: 0, errors: [] },
   lists: { success: 0, failed: 0, errors: [] },
-  listItems: { success: 0, failed: 0 },
-  listShares: { success: 0, failed: 0, skipped: 0 },
+  listItems: { success: 0, failed: 0, errors: [] },
+  listShares: { success: 0, failed: 0, skipped: 0, errors: [] },
   mealPlans: { success: 0, failed: 0, errors: [] },
-  mealPlanRecipes: { success: 0, failed: 0, skipped: 0 },
-  mealPlanShares: { success: 0, failed: 0, skipped: 0 },
+  mealPlanRecipes: { success: 0, failed: 0, skipped: 0, errors: [] },
+  mealPlanShares: { success: 0, failed: 0, skipped: 0, errors: [] },
 }
 
 // --- Set of successfully migrated recipe IDs (Supabase UUIDs) for FK validation ---
@@ -432,12 +432,7 @@ async function processBatches<T>(
  * @param rows - Array of value-tuple strings, e.g. ["('a', 1)", "('b', 2)"]
  * @param conflictClause - e.g. "ON CONFLICT (id) DO NOTHING"
  */
-async function batchInsert(
-  table: string,
-  columns: string[],
-  rows: string[],
-  conflictClause: string
-): Promise<void> {
+async function batchInsert(table: string, columns: string[], rows: string[], conflictClause: string): Promise<void> {
   if (rows.length === 0) return
   const sql = `INSERT INTO ${table} (${columns.join(", ")}) VALUES\n${rows.join(",\n")}\n${conflictClause}`
   await pgClient.query(sql)
@@ -546,7 +541,9 @@ async function migrateRecipes(): Promise<void> {
       recipes: counters.recipes.success,
       recipesFailed: counters.recipes.failed,
       ingredients: counters.recipeIngredients.success,
+      ingredientsFailed: counters.recipeIngredients.failed,
       instructions: counters.recipeInstructions.success,
+      instructionsFailed: counters.recipeInstructions.failed,
     }
 
     for (const doc of batch) {
@@ -671,13 +668,21 @@ async function migrateRecipes(): Promise<void> {
         const ingRows: string[] = []
         for (let i = 0; i < ingredients.length; i++) {
           const ing = ingredients[i]
+
+          // Derive the text value — skip ingredients with no meaningful text
+          const ingText = truncate(ing.name || ing.text || "", 500)
+          if (!ingText && !ing.isGroupHeader) {
+            // Skip empty filler ingredients (no name, no text, not a group header)
+            continue
+          }
+
           ingRows.push(`(
               ${sqlVal(ing.id, "uuid")},
               ${sqlVal(recipeId, "uuid")},
               ${sqlVal(truncate(ing.name || ing.text || "", 500))},
               ${sqlVal(truncate(ing.description, 500))},
-              ${sqlVal(ing.quantity, "number")},
-              ${sqlVal(ing.quantity2, "number")},
+              ${sqlVal(ing.quantity != null ? Math.abs(Number(ing.quantity)) : null, "number")},
+              ${sqlVal(ing.quantity2 != null ? Math.abs(Number(ing.quantity2)) : null, "number")},
               ${sqlVal(truncate(ing.unitOfMeasure, 200))},
               ${sqlVal(truncate(ing.unitOfMeasureID, 200))},
               ${sqlVal(ing.isGroupHeader || false, "boolean")},
@@ -709,6 +714,7 @@ async function migrateRecipes(): Promise<void> {
             counters.recipeIngredients.success += ingRows.length
           } catch (err: any) {
             counters.recipeIngredients.failed += ingRows.length
+            counters.recipeIngredients.errors.push({ id: recipeId, error: err.message })
           }
         }
 
@@ -745,6 +751,7 @@ async function migrateRecipes(): Promise<void> {
             counters.recipeInstructions.success += instRows.length
           } catch (err: any) {
             counters.recipeInstructions.failed += instRows.length
+            counters.recipeInstructions.errors.push({ id: recipeId, error: err.message })
           }
         }
       } catch (err: any) {
@@ -754,13 +761,17 @@ async function migrateRecipes(): Promise<void> {
     }
 
     console.log(
-      `✓ ${counters.recipes.success - before.recipes} recipes | ` +
-        `${counters.recipeIngredients.success - before.ingredients} ingredients | ` +
-        `${counters.recipeInstructions.success - before.instructions} instructions | ` +
-        `✗ ${counters.recipes.failed - before.recipesFailed}`
+      `Recipes:       ✓ ${counters.recipes.success - before.recipes} | ✗ ${counters.recipes.failed - before.recipesFailed}`
+    )
+    console.log(
+      `Ingredients:   ✓ ${counters.recipeIngredients.success - before.ingredients} | ✗ ${counters.recipeIngredients.failed - before.ingredientsFailed}`
+    )
+    console.log(
+      `Instructions:  ✓ ${counters.recipeInstructions.success - before.instructions} | ✗ ${counters.recipeInstructions.failed - before.instructionsFailed}`
     )
   })
 
+  console.log('Recipe migration complete!')
   console.log(`  Recipes:      ✓ ${counters.recipes.success} | ✗ ${counters.recipes.failed}`)
   console.log(`  Ingredients:  ✓ ${counters.recipeIngredients.success} | ✗ ${counters.recipeIngredients.failed}`)
   console.log(`  Instructions: ✓ ${counters.recipeInstructions.success} | ✗ ${counters.recipeInstructions.failed}`)
@@ -780,7 +791,12 @@ async function migrateCollections(): Promise<void> {
     const totalBatches = Math.ceil(docs.length / BATCH_SIZE)
     console.log(`  Batch ${batchNum}/${totalBatches} (${offset + 1}-${offset + batch.length})...`)
 
-    const before = { success: counters.collections.success, failed: counters.collections.failed }
+    const before = {
+      collections: counters.collections.success,
+      collectionsFailed: counters.collections.failed,
+      shares: counters.collectionShares.success,
+      sharesFailed: counters.collectionShares.failed,
+    }
 
     for (const doc of batch) {
       const data = doc.data()
@@ -848,6 +864,10 @@ async function migrateCollections(): Promise<void> {
             } catch (err: any) {
               // Likely FK violation if shared user wasn't migrated
               counters.collectionShares.failed++
+              counters.collectionShares.errors.push({
+                id: `${collectionId}:${sharedWithFirebaseUid}`,
+                error: err.message,
+              })
             }
           }
         } catch (err: any) {
@@ -859,7 +879,12 @@ async function migrateCollections(): Promise<void> {
       }
     }
 
-    console.log(`✓ ${counters.collections.success - before.success} | ✗ ${counters.collections.failed - before.failed}`)
+    console.log(
+      `Collections:  ✓ ${counters.collections.success - before.collections} | ✗ ${counters.collections.failed - before.collectionsFailed}`
+    )
+    console.log(
+      `Shares:       ✓ ${counters.collectionShares.success - before.shares} | ✗ ${counters.collectionShares.failed - before.sharesFailed}`
+    )
   })
 
   // --- Migrate collection_recipes from junction collection ---
@@ -900,6 +925,7 @@ async function migrateCollections(): Promise<void> {
           counters.collectionRecipes.success++
         } catch (err: any) {
           counters.collectionRecipes.failed++
+          counters.collectionRecipes.errors.push({ id: `${collectionId}:${recipeId}`, error: err.message })
         }
       }
     })
@@ -928,11 +954,13 @@ async function migrateCollections(): Promise<void> {
           counters.collectionRecipes.success++
         } catch (err: any) {
           counters.collectionRecipes.failed++
+          counters.collectionRecipes.errors.push({ id: `${collectionId}:${recipeId}`, error: err.message })
         }
       }
     }
   }
 
+  console.log('Collection migration complete!')
   console.log(`  Collections:       ✓ ${counters.collections.success} | ✗ ${counters.collections.failed}`)
   console.log(
     `  Collection Recipes: ✓ ${counters.collectionRecipes.success} | ⊘ ${counters.collectionRecipes.skipped} | ✗ ${counters.collectionRecipes.failed}`
@@ -956,7 +984,14 @@ async function migrateLists(): Promise<void> {
     const totalBatches = Math.ceil(docs.length / BATCH_SIZE)
     console.log(`  Batch ${batchNum}/${totalBatches} (${offset + 1}-${offset + batch.length})...`)
 
-    const before = { success: counters.lists.success, failed: counters.lists.failed }
+    const before = {
+      lists: counters.lists.success,
+      listsFailed: counters.lists.failed,
+      items: counters.listItems.success,
+      itemsFailed: counters.listItems.failed,
+      shares: counters.listShares.success,
+      sharesFailed: counters.listShares.failed,
+    }
 
     for (const doc of batch) {
       const data = doc.data()
@@ -1013,8 +1048,8 @@ async function migrateLists(): Promise<void> {
                 ${sqlVal(listId, "uuid")},
                 ${sqlVal(truncate(item.name || item.text || "", 500))},
                 ${sqlVal(truncate(item.description, 500))},
-                ${sqlVal(item.quantity, "number")},
-                ${sqlVal(item.quantity2, "number")},
+                ${sqlVal(item.quantity != null ? Math.abs(Number(item.quantity)) : null, "number")},
+                ${sqlVal(item.quantity2 != null ? Math.abs(Number(item.quantity2)) : null, "number")},
                 ${sqlVal(truncate(item.unitOfMeasure, 200))},
                 ${sqlVal(truncate(item.unitOfMeasureID, 200))},
                 ${sqlVal(item.isGroupHeader || false, "boolean")},
@@ -1030,6 +1065,7 @@ async function migrateLists(): Promise<void> {
             counters.listItems.success++
           } catch (err: any) {
             counters.listItems.failed++
+            counters.listItems.errors.push({ id: item.id || `${listId}:item-${i}`, error: err.message })
           }
         }
 
@@ -1067,6 +1103,7 @@ async function migrateLists(): Promise<void> {
               counters.listShares.success++
             } catch (err: any) {
               counters.listShares.failed++
+              counters.listShares.errors.push({ id: `${listId}:${sharedWithFirebaseUid}`, error: err.message })
             }
           }
         } catch (err: any) {
@@ -1078,9 +1115,16 @@ async function migrateLists(): Promise<void> {
       }
     }
 
-    console.log(`✓ ${counters.lists.success - before.success} | ✗ ${counters.lists.failed - before.failed}`)
+    console.log(`Lists:   ✓ ${counters.lists.success - before.lists} | ✗ ${counters.lists.failed - before.listsFailed}`)
+    console.log(
+      `Items:   ✓ ${counters.listItems.success - before.items} | ✗ ${counters.listItems.failed - before.itemsFailed}`
+    )
+    console.log(
+      `Shares:  ✓ ${counters.listShares.success - before.shares} | ✗ ${counters.listShares.failed - before.sharesFailed}`
+    )
   })
 
+  console.log('List migration complete!')
   console.log(`  Lists:       ✓ ${counters.lists.success} | ✗ ${counters.lists.failed}`)
   console.log(`  List Items:  ✓ ${counters.listItems.success} | ✗ ${counters.listItems.failed}`)
   console.log(
@@ -1102,7 +1146,14 @@ async function migrateMealPlans(): Promise<void> {
     const totalBatches = Math.ceil(docs.length / BATCH_SIZE)
     console.log(`  Batch ${batchNum}/${totalBatches} (${offset + 1}-${offset + batch.length})...`)
 
-    const before = { success: counters.mealPlans.success, failed: counters.mealPlans.failed }
+    const before = {
+      mealPlans: counters.mealPlans.success,
+      mealPlansFailed: counters.mealPlans.failed,
+      recipes: counters.mealPlanRecipes.success,
+      recipesFailed: counters.mealPlanRecipes.failed,
+      shares: counters.mealPlanShares.success,
+      sharesFailed: counters.mealPlanShares.failed,
+    }
 
     for (const doc of batch) {
       const data = doc.data()
@@ -1184,6 +1235,7 @@ async function migrateMealPlans(): Promise<void> {
               counters.mealPlanRecipes.success++
             } catch (err: any) {
               counters.mealPlanRecipes.failed++
+              counters.mealPlanRecipes.errors.push({ id: itemId, error: err.message })
             }
           }
         } catch (err: any) {
@@ -1224,6 +1276,7 @@ async function migrateMealPlans(): Promise<void> {
               counters.mealPlanShares.success++
             } catch (err: any) {
               counters.mealPlanShares.failed++
+              counters.mealPlanShares.errors.push({ id: `${mealPlanId}:${sharedWithFirebaseUid}`, error: err.message })
             }
           }
         } catch (err: any) {
@@ -1235,9 +1288,18 @@ async function migrateMealPlans(): Promise<void> {
       }
     }
 
-    console.log(`✓ ${counters.mealPlans.success - before.success} | ✗ ${counters.mealPlans.failed - before.failed}`)
+    console.log(
+      `Meal Plans:  ✓ ${counters.mealPlans.success - before.mealPlans} | ✗ ${counters.mealPlans.failed - before.mealPlansFailed}`
+    )
+    console.log(
+      `Recipes:     ✓ ${counters.mealPlanRecipes.success - before.recipes} | ✗ ${counters.mealPlanRecipes.failed - before.recipesFailed}`
+    )
+    console.log(
+      `Shares:      ✓ ${counters.mealPlanShares.success - before.shares} | ✗ ${counters.mealPlanShares.failed - before.sharesFailed}`
+    )
   })
 
+  console.log('Meal plan migration complete!')
   console.log(`  Meal Plans:        ✓ ${counters.mealPlans.success} | ✗ ${counters.mealPlans.failed}`)
   console.log(
     `  Meal Plan Recipes: ✓ ${counters.mealPlanRecipes.success} | ⊘ ${counters.mealPlanRecipes.skipped} | ✗ ${counters.mealPlanRecipes.failed}`
@@ -1349,9 +1411,17 @@ async function main() {
   const allErrors = [
     ...counters.profiles.errors.map((e) => ({ table: "profiles", ...e })),
     ...counters.recipes.errors.map((e) => ({ table: "recipes", ...e })),
+    ...counters.recipeIngredients.errors.map((e) => ({ table: "recipe_ingredients", ...e })),
+    ...counters.recipeInstructions.errors.map((e) => ({ table: "recipe_instructions", ...e })),
     ...counters.collections.errors.map((e) => ({ table: "collections", ...e })),
+    ...counters.collectionRecipes.errors.map((e) => ({ table: "collection_recipes", ...e })),
+    ...counters.collectionShares.errors.map((e) => ({ table: "collection_shares", ...e })),
     ...counters.lists.errors.map((e) => ({ table: "lists", ...e })),
+    ...counters.listItems.errors.map((e) => ({ table: "list_items", ...e })),
+    ...counters.listShares.errors.map((e) => ({ table: "list_shares", ...e })),
     ...counters.mealPlans.errors.map((e) => ({ table: "meal_plans", ...e })),
+    ...counters.mealPlanRecipes.errors.map((e) => ({ table: "meal_plan_recipes", ...e })),
+    ...counters.mealPlanShares.errors.map((e) => ({ table: "meal_plan_shares", ...e })),
   ]
 
   if (allErrors.length > 0) {
@@ -1360,10 +1430,6 @@ async function main() {
     console.log("")
     console.log(`Errors written to: ${errorFile}`)
     console.log("")
-    console.log("First 10 errors:")
-    allErrors.slice(0, 10).forEach((e) => {
-      console.log(`  [${e.table}] ${e.id}: ${e.error}`)
-    })
   }
 }
 

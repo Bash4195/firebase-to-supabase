@@ -8,3 +8,5 @@ node_modules
 
 database/firebase-service-accounts
 database/migration_errors.json
+
+storage/storage_migration_errors.json

@@ -23,7 +23,10 @@
     "backfill:auth:production": "env-cmd -f .env.production npx ts-node ./auth/import_users.ts ./auth/users-production.json 1000",
     "backfill:database:dev": "env-cmd -f .env.development npx ts-node ./database/migrate_database.ts 1000",
     "backfill:database:staging": "env-cmd -f .env.staging npx ts-node ./database/migrate_database.ts 1000",
-    "backfill:database:production": "env-cmd -f .env.production npx ts-node ./database/migrate_database.ts 1000"
+    "backfill:database:production": "env-cmd -f .env.production npx ts-node ./database/migrate_database.ts 1000",
+    "backfill:storage:dev": "env-cmd -f .env.development npx ts-node ./storage/migrate_storage.ts 100 10",
+    "backfill:storage:staging": "env-cmd -f .env.staging npx ts-node ./storage/migrate_storage.ts 100 10",
+    "backfill:storage:production": "env-cmd -f .env.production npx ts-node ./storage/migrate_storage.ts 100 10"
   },
   "devDependencies": {
     "@types/node": "^25.6.2"

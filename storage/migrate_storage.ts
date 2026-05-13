@@ -1,5 +1,5 @@
 // Migrates recipe images from Firebase Storage to Supabase Storage.
-// Run this AFTER import_users.ts and migrate_database.ts have been executed.
+// Run this AFTER migrate_auth.ts and migrate_database.ts have been executed.
 
 import * as admin from "firebase-admin"
 import * as fs from "fs"

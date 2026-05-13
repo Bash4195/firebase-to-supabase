@@ -42,7 +42,7 @@ const INPUT_FILE = args[0]
 const BATCH_SIZE = parseInt(args[1], 10) || 20
 
 if (!INPUT_FILE) {
-  console.log("Usage: npx ts-node import_users.ts <path_to_json_file> [<batch_size>]")
+  console.log("Usage: npx ts-node migrate_auth.ts <path_to_json_file> [<batch_size>]")
   console.log("")
   console.log("  path_to_json_file  Path to the firebase auth:export JSON file")
   console.log("  batch_size         Users per batch (default: 20)")

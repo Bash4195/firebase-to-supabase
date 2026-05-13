@@ -1,5 +1,5 @@
 // Migrates all Firestore data to Supabase Postgres.
-// Run this AFTER import_users.ts has been executed (profiles are auto-created by trigger).
+// Run this AFTER migrate_auth.ts has been executed (profiles are auto-created by trigger).
 
 import * as admin from "firebase-admin"
 import * as fs from "fs"

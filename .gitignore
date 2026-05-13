@@ -6,7 +6,11 @@ node_modules
 .env.staging
 .env.production
 
+auth/users-*
+
 database/firebase-service-accounts
 database/migration_errors.json
 
 storage/storage_migration_errors.json
+
+firebase-debug.log

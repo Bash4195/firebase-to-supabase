@@ -438,12 +438,31 @@ async function batchInsert(table: string, columns: string[], rows: string[], con
   await pgClient.query(sql)
 }
 
-/**
- * Fetch all documents from a Firestore collection
- */
-async function fetchCollection(collectionName: string): Promise<admin.firestore.QueryDocumentSnapshot[]> {
-  const snapshot = await db.collection(collectionName).get()
-  return snapshot.docs
+async function* getFirestoreBatches(
+  collectionName: string,
+  batchSize: number
+): AsyncGenerator<{
+  batch: admin.firestore.QueryDocumentSnapshot[]
+  batchNum: number
+}> {
+  let lastDoc: admin.firestore.QueryDocumentSnapshot | null = null
+  let batchNum = 0
+
+  while (true) {
+    let query = db.collection(collectionName).orderBy(
+      admin.firestore.FieldPath.documentId()
+    )
+
+    if (lastDoc) query = query.startAfter(lastDoc)
+    query = query.limit(batchSize)
+
+    const snapshot = await query.get()
+    if (snapshot.empty) break
+
+    batchNum++
+    yield { batch: snapshot.docs, batchNum }
+    lastDoc = snapshot.docs[snapshot.docs.length - 1]
+  }
 }
 
 /**
@@ -469,13 +488,12 @@ async function fetchSubcollection(
 async function migrateProfiles(): Promise<void> {
   console.log("\n--- Migrating Profiles ---")
 
-  const docs = await fetchCollection(COLLECTIONS.users)
-  console.log(`  Found ${docs.length} user documents`)
+  let totalProcessed = 0
 
-  await processBatches(docs, BATCH_SIZE, async (batch, offset) => {
-    const batchNum = Math.floor(offset / BATCH_SIZE) + 1
-    const totalBatches = Math.ceil(docs.length / BATCH_SIZE)
-    console.log(`  Batch ${batchNum}/${totalBatches} (${offset + 1}-${offset + batch.length})...`)
+  for await (const { batch, batchNum } of getFirestoreBatches(COLLECTIONS.users, BATCH_SIZE)) {
+    const offset = totalProcessed
+    totalProcessed += batch.length
+    console.log(`  Batch ${batchNum} (${offset + 1}-${totalProcessed})...`)
 
     const before = { success: counters.profiles.success, failed: counters.profiles.failed }
 
@@ -518,7 +536,7 @@ async function migrateProfiles(): Promise<void> {
     }
 
     console.log(`  ✓ ${counters.profiles.success - before.success} | ✗ ${counters.profiles.failed - before.failed}`)
-  })
+  }
 
   console.log(`  ✓ ${counters.profiles.success} | ✗ ${counters.profiles.failed}`)
 }
@@ -529,13 +547,12 @@ async function migrateProfiles(): Promise<void> {
 async function migrateRecipes(): Promise<void> {
   console.log("\n--- Migrating Recipes ---")
 
-  const docs = await fetchCollection(COLLECTIONS.recipes)
-  console.log(`  Found ${docs.length} recipe documents`)
+  let totalProcessed = 0
 
-  await processBatches(docs, BATCH_SIZE, async (batch, offset) => {
-    const batchNum = Math.floor(offset / BATCH_SIZE) + 1
-    const totalBatches = Math.ceil(docs.length / BATCH_SIZE)
-    console.log(`  Batch ${batchNum}/${totalBatches} (${offset + 1}-${offset + batch.length})...`)
+  for await (const { batch, batchNum } of getFirestoreBatches(COLLECTIONS.recipes, BATCH_SIZE)) {
+    const offset = totalProcessed
+    totalProcessed += batch.length
+    console.log(`  Batch ${batchNum} (${offset + 1}-${totalProcessed})...`)
 
     const before = {
       recipes: counters.recipes.success,
@@ -769,9 +786,9 @@ async function migrateRecipes(): Promise<void> {
     console.log(
       `Instructions:  ✓ ${counters.recipeInstructions.success - before.instructions} | ✗ ${counters.recipeInstructions.failed - before.instructionsFailed}`
     )
-  })
+  }
 
-  console.log('Recipe migration complete!')
+  console.log("Recipe migration complete!")
   console.log(`  Recipes:      ✓ ${counters.recipes.success} | ✗ ${counters.recipes.failed}`)
   console.log(`  Ingredients:  ✓ ${counters.recipeIngredients.success} | ✗ ${counters.recipeIngredients.failed}`)
   console.log(`  Instructions: ✓ ${counters.recipeInstructions.success} | ✗ ${counters.recipeInstructions.failed}`)
@@ -783,13 +800,12 @@ async function migrateRecipes(): Promise<void> {
 async function migrateCollections(): Promise<void> {
   console.log("\n--- Migrating Collections ---")
 
-  const docs = await fetchCollection(COLLECTIONS.collections)
-  console.log(`  Found ${docs.length} collection documents`)
+  let totalProcessed = 0
 
-  await processBatches(docs, BATCH_SIZE, async (batch, offset) => {
-    const batchNum = Math.floor(offset / BATCH_SIZE) + 1
-    const totalBatches = Math.ceil(docs.length / BATCH_SIZE)
-    console.log(`  Batch ${batchNum}/${totalBatches} (${offset + 1}-${offset + batch.length})...`)
+  for await (const { batch, batchNum } of getFirestoreBatches(COLLECTIONS.collections, BATCH_SIZE)) {
+    const offset = totalProcessed
+    totalProcessed += batch.length
+    console.log(`  Batch ${batchNum} (${offset + 1}-${totalProcessed})...`)
 
     const before = {
       collections: counters.collections.success,
@@ -885,15 +901,12 @@ async function migrateCollections(): Promise<void> {
     console.log(
       `Shares:       ✓ ${counters.collectionShares.success - before.shares} | ✗ ${counters.collectionShares.failed - before.sharesFailed}`
     )
-  })
+  }
 
   // --- Migrate collection_recipes from junction collection ---
   console.log("  Migrating collection_recipes from junction collection...")
   try {
-    const junctionDocs = await fetchCollection(COLLECTIONS.junctionCollectionRecipes)
-    console.log(`  Found ${junctionDocs.length} junction documents`)
-
-    await processBatches(junctionDocs, BATCH_SIZE, async (batch) => {
+    for await (const { batch } of getFirestoreBatches(COLLECTIONS.junctionCollectionRecipes, BATCH_SIZE)) {
       for (const jDoc of batch) {
         const jData = jDoc.data()
         const collectionId = jData.collectionId
@@ -928,39 +941,12 @@ async function migrateCollections(): Promise<void> {
           counters.collectionRecipes.errors.push({ id: `${collectionId}:${recipeId}`, error: err.message })
         }
       }
-    })
+    }
   } catch (err: any) {
     console.log(`  ⚠ Could not fetch junction collection: ${err.message}`)
-    console.log("  Falling back to Collection.recipeIds arrays...")
-
-    // Fallback: use recipeIds from collection documents
-    for (const doc of docs) {
-      const data = doc.data()
-      const collectionId = doc.id || data.id
-      const recipeIds: string[] = data.recipeIds || []
-
-      for (const recipeId of recipeIds) {
-        if (!migratedRecipeIds.has(recipeId)) {
-          counters.collectionRecipes.skipped++
-          continue
-        }
-        try {
-          const sql = `
-            INSERT INTO public.collection_recipes (collection_id, recipe_id)
-            VALUES (${sqlVal(collectionId, "uuid")}, ${sqlVal(recipeId, "uuid")})
-            ON CONFLICT (collection_id, recipe_id) DO NOTHING
-          `
-          await pgClient.query(sql)
-          counters.collectionRecipes.success++
-        } catch (err: any) {
-          counters.collectionRecipes.failed++
-          counters.collectionRecipes.errors.push({ id: `${collectionId}:${recipeId}`, error: err.message })
-        }
-      }
-    }
   }
 
-  console.log('Collection migration complete!')
+  console.log("Collection migration complete!")
   console.log(`  Collections:       ✓ ${counters.collections.success} | ✗ ${counters.collections.failed}`)
   console.log(
     `  Collection Recipes: ✓ ${counters.collectionRecipes.success} | ⊘ ${counters.collectionRecipes.skipped} | ✗ ${counters.collectionRecipes.failed}`
@@ -976,13 +962,12 @@ async function migrateCollections(): Promise<void> {
 async function migrateLists(): Promise<void> {
   console.log("\n--- Migrating Lists ---")
 
-  const docs = await fetchCollection(COLLECTIONS.lists)
-  console.log(`  Found ${docs.length} list documents`)
+  let totalProcessed = 0
 
-  await processBatches(docs, BATCH_SIZE, async (batch, offset) => {
-    const batchNum = Math.floor(offset / BATCH_SIZE) + 1
-    const totalBatches = Math.ceil(docs.length / BATCH_SIZE)
-    console.log(`  Batch ${batchNum}/${totalBatches} (${offset + 1}-${offset + batch.length})...`)
+  for await (const { batch, batchNum } of getFirestoreBatches(COLLECTIONS.lists, BATCH_SIZE)) {
+    const offset = totalProcessed
+    totalProcessed += batch.length
+    console.log(`  Batch ${batchNum} (${offset + 1}-${totalProcessed})...`)
 
     const before = {
       lists: counters.lists.success,
@@ -1122,9 +1107,9 @@ async function migrateLists(): Promise<void> {
     console.log(
       `Shares:  ✓ ${counters.listShares.success - before.shares} | ✗ ${counters.listShares.failed - before.sharesFailed}`
     )
-  })
+  }
 
-  console.log('List migration complete!')
+  console.log("List migration complete!")
   console.log(`  Lists:       ✓ ${counters.lists.success} | ✗ ${counters.lists.failed}`)
   console.log(`  List Items:  ✓ ${counters.listItems.success} | ✗ ${counters.listItems.failed}`)
   console.log(
@@ -1138,13 +1123,12 @@ async function migrateLists(): Promise<void> {
 async function migrateMealPlans(): Promise<void> {
   console.log("\n--- Migrating Meal Plans ---")
 
-  const docs = await fetchCollection(COLLECTIONS.mealPlans)
-  console.log(`  Found ${docs.length} meal plan documents`)
+  let totalProcessed = 0
 
-  await processBatches(docs, BATCH_SIZE, async (batch, offset) => {
-    const batchNum = Math.floor(offset / BATCH_SIZE) + 1
-    const totalBatches = Math.ceil(docs.length / BATCH_SIZE)
-    console.log(`  Batch ${batchNum}/${totalBatches} (${offset + 1}-${offset + batch.length})...`)
+  for await (const { batch, batchNum } of getFirestoreBatches(COLLECTIONS.mealPlans, BATCH_SIZE)) {
+    const offset = totalProcessed
+    totalProcessed += batch.length
+    console.log(`  Batch ${batchNum} (${offset + 1}-${totalProcessed})...`)
 
     const before = {
       mealPlans: counters.mealPlans.success,
@@ -1297,9 +1281,9 @@ async function migrateMealPlans(): Promise<void> {
     console.log(
       `Shares:      ✓ ${counters.mealPlanShares.success - before.shares} | ✗ ${counters.mealPlanShares.failed - before.sharesFailed}`
     )
-  })
+  }
 
-  console.log('Meal plan migration complete!')
+  console.log("Meal plan migration complete!")
   console.log(`  Meal Plans:        ✓ ${counters.mealPlans.success} | ✗ ${counters.mealPlans.failed}`)
   console.log(
     `  Meal Plan Recipes: ✓ ${counters.mealPlanRecipes.success} | ⊘ ${counters.mealPlanRecipes.skipped} | ✗ ${counters.mealPlanRecipes.failed}`

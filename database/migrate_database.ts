@@ -111,6 +111,54 @@ function firestoreTimestampToDate(ts: any): string | null {
 }
 
 /**
+ * Parse a date value from various formats into an ISO 8601 string suitable for timestamptz.
+ * Handles Firestore Timestamps, ISO strings, date-only strings, unix timestamps, etc.
+ * Returns null if the value cannot be parsed into a valid date.
+ */
+function parseDateToISO(val: any): string | null {
+  if (val === null || val === undefined) return null
+
+  // If it's an object, try Firestore Timestamp conversion
+  if (typeof val === "object") {
+    return firestoreTimestampToISO(val)
+  }
+
+  // If it's a number, treat as unix timestamp (seconds or ms)
+  if (typeof val === "number") {
+    if (isNaN(val) || !isFinite(val)) return null
+    // Heuristic: values > 1e10 are likely ms, smaller are seconds
+    const ms = val > 1e10 ? val : val * 1000
+    const d = new Date(ms)
+    return isNaN(d.getTime()) ? null : d.toISOString()
+  }
+
+  // String: coerce and trim
+  const str = String(val).trim()
+  if (!str || str === "undefined" || str === "null" || str === "Invalid Date") return null
+
+  // Try direct Date parse (handles ISO 8601 and many common formats)
+  const d = new Date(str)
+  if (!isNaN(d.getTime())) return d.toISOString()
+
+  // Try YYYY-MM-DD strictly (some runtimes reject this in `new Date()`)
+  const dateOnlyMatch = str.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (dateOnlyMatch) {
+    const d2 = new Date(+dateOnlyMatch[1], +dateOnlyMatch[2] - 1, +dateOnlyMatch[3], 12, 0, 0)
+    if (!isNaN(d2.getTime())) return d2.toISOString()
+  }
+
+  // Try MM/DD/YYYY
+  const slashMatch = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/)
+  if (slashMatch) {
+    const d3 = new Date(+slashMatch[3], +slashMatch[1] - 1, +slashMatch[2], 12, 0, 0)
+    if (!isNaN(d3.getTime())) return d3.toISOString()
+  }
+
+  // Unparseable — let it become NULL rather than crashing the migration
+  return null
+}
+
+/**
  * Escape a string for use in SQL (prevent SQL injection in migration scripts)
  */
 function escSql(val: string | null | undefined): string {
@@ -412,20 +460,6 @@ function mapMealType(val: string | null | undefined): string | null {
 }
 
 /**
- * Process batches with a callback
- */
-async function processBatches<T>(
-  items: T[],
-  batchSize: number,
-  fn: (batch: T[], batchIndex: number) => Promise<void>
-): Promise<void> {
-  for (let i = 0; i < items.length; i += batchSize) {
-    const batch = items.slice(i, i + batchSize)
-    await fn(batch, i)
-  }
-}
-
-/**
  * Execute a batched multi-row INSERT.
  * @param table - Fully qualified table name (e.g. "public.recipes")
  * @param columns - Array of column names
@@ -645,8 +679,8 @@ async function migrateRecipes(): Promise<void> {
             ${sqlVal(truncate(data.source?.name, 500))},
             ${sqlVal(truncate(data.source?.url, 2000))},
             ${sqlVal(authors, "jsonb")},
-            ${sqlVal(data.datePublished ? data.datePublished : null, "timestamptz")},
-            ${sqlVal(data.dateModified ? data.dateModified : null, "timestamptz")},
+            ${sqlVal(parseDateToISO(data.datePublished), "timestamptz")},
+            ${sqlVal(parseDateToISO(data.dateModified), "timestamptz")},
             ${keywords ? sqlVal(keywords, "text[]") : "NULL"},
             ${category ? sqlVal(category, "text[]") : "NULL"},
             ${cuisine ? sqlVal(cuisine, "text[]") : "NULL"},

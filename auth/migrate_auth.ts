@@ -1,5 +1,4 @@
-// TODO: As part of the migration, we will need to update things that used the user id as the source of truth
-//  Stripe, RevenueCat, Sentry, etc.
+// This script runs at 25k users/hour
 
 import * as fs from "fs"
 import * as path from "path"
@@ -188,6 +187,7 @@ async function migrateUser(
   user: FirebaseUser
 ): Promise<{ success: boolean; skipped: boolean; supabaseId?: string; error?: string }> {
   if (!user.email) {
+    console.log('Skipped (no email): ', user.localId)
     return { success: false, skipped: true, error: "No email address" }
   }
 

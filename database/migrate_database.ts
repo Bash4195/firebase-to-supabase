@@ -1,8 +1,6 @@
 // Migrates all Firestore data to Supabase Postgres.
 // Run this AFTER migrate_auth.ts has been executed (profiles are auto-created by trigger).
 
-// Current run restarted at 14:19 May 14 after fixing the datePublished/dateModified issue
-
 // TODO: Verify the datePublished fix actually worked
 //  Check the logs and grab some ids of recipes that failed and verify it got saved in postgres
 //  IDs already found:
@@ -20,6 +18,7 @@ import * as admin from "firebase-admin"
 import * as fs from "fs"
 import * as path from "path"
 import { Client } from "pg"
+import { v4 as uuidv4 } from "uuid"
 
 import { firebaseUidToUuid } from "../helpers/firebaseUidToUuid"
 
@@ -735,7 +734,7 @@ async function migrateRecipes(): Promise<void> {
                 unit_of_measure, unit_of_measure_id, is_group_header,
                 category_id, sort_order
               ) VALUES (
-                ${sqlVal(ing.id, "uuid")},
+                ${sqlVal(ing.id || uuidv4(), "uuid")},
                 ${sqlVal(recipeId, "uuid")},
                 ${sqlVal(truncate(ing.name || ing.text || "", 500))},
                 ${sqlVal(truncate(ing.description, 500))},
@@ -783,7 +782,7 @@ async function migrateRecipes(): Promise<void> {
               INSERT INTO public.recipe_instructions (
                 id, recipe_id, text, is_group_header, url, image_url, sort_order
               ) VALUES (
-                ${sqlVal(inst.id, "uuid")},
+                ${sqlVal(inst.id || uuidv4(), "uuid")},
                 ${sqlVal(recipeId, "uuid")},
                 ${sqlVal(instText)},
                 ${sqlVal(inst.isGroupHeader || false, "boolean")},

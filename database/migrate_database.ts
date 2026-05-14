@@ -1,6 +1,21 @@
 // Migrates all Firestore data to Supabase Postgres.
 // Run this AFTER migrate_auth.ts has been executed (profiles are auto-created by trigger).
 
+// Current run restarted at 14:19 May 14 after fixing the datePublished/dateModified issue
+
+// TODO: Verify the datePublished fix actually worked
+//  Check the logs and grab some ids of recipes that failed and verify it got saved in postgres
+//  IDs already found:
+//  18e63030-1abf-439d-890a-220592fee630
+//  19013ba4-c4a4-4a58-b4ca-28dc7aac4360
+//  18e03911-7b46-42d4-b356-ea4218f9862d
+//  18dc48e4-ab8d-4ef7-9be4-d438a5ae35d0
+//  18cae324-d0db-40b0-9f54-8d4b7ae494af
+//  18a4eb4c-b24a-41ab-9ed2-3c2fc92a3911
+//  1895dd46-6f42-4a8d-89d7-1f19afacc6f4
+//  181ed54d-4593-406b-af3e-cf2ea0fd0ec2
+//  17fab680-dc9a-4cb8-ac83-fd4acd27ddb6
+
 import * as admin from "firebase-admin"
 import * as fs from "fs"
 import * as path from "path"
@@ -459,19 +474,6 @@ function mapMealType(val: string | null | undefined): string | null {
   return valid.includes(val) ? val : null
 }
 
-/**
- * Execute a batched multi-row INSERT.
- * @param table - Fully qualified table name (e.g. "public.recipes")
- * @param columns - Array of column names
- * @param rows - Array of value-tuple strings, e.g. ["('a', 1)", "('b', 2)"]
- * @param conflictClause - e.g. "ON CONFLICT (id) DO NOTHING"
- */
-async function batchInsert(table: string, columns: string[], rows: string[], conflictClause: string): Promise<void> {
-  if (rows.length === 0) return
-  const sql = `INSERT INTO ${table} (${columns.join(", ")}) VALUES\n${rows.join(",\n")}\n${conflictClause}`
-  await pgClient.query(sql)
-}
-
 async function* getFirestoreBatches(
   collectionName: string,
   batchSize: number
@@ -714,9 +716,8 @@ async function migrateRecipes(): Promise<void> {
         migratedRecipeIds.add(recipeId)
         counters.recipes.success++
 
-        // --- Insert ingredients ---
+        // --- Insert ingredients (one at a time to isolate failures) ---
         const ingredients: any[] = data.ingredients || []
-        const ingRows: string[] = []
         for (let i = 0; i < ingredients.length; i++) {
           const ing = ingredients[i]
 
@@ -727,82 +728,79 @@ async function migrateRecipes(): Promise<void> {
             continue
           }
 
-          ingRows.push(`(
-              ${sqlVal(ing.id, "uuid")},
-              ${sqlVal(recipeId, "uuid")},
-              ${sqlVal(truncate(ing.name || ing.text || "", 500))},
-              ${sqlVal(truncate(ing.description, 500))},
-              ${sqlVal(ing.quantity != null ? Math.abs(Number(ing.quantity)) : null, "number")},
-              ${sqlVal(ing.quantity2 != null ? Math.abs(Number(ing.quantity2)) : null, "number")},
-              ${sqlVal(truncate(ing.unitOfMeasure, 200))},
-              ${sqlVal(truncate(ing.unitOfMeasureID, 200))},
-              ${sqlVal(ing.isGroupHeader || false, "boolean")},
-              ${mapIngredientCategory(ing.category_id) ? sqlVal(mapIngredientCategory(ing.category_id), "enum") : "NULL"},
-              ${sqlVal(i, "number")}
-            )`)
-        }
-
-        if (ingRows.length > 0) {
           try {
-            await batchInsert(
-              "public.recipe_ingredients",
-              [
-                "id",
-                "recipe_id",
-                "text",
-                "description",
-                "quantity",
-                "quantity2",
-                "unit_of_measure",
-                "unit_of_measure_id",
-                "is_group_header",
-                "category_id",
-                "sort_order",
-              ],
-              ingRows,
-              "ON CONFLICT (id) DO NOTHING"
-            )
-            counters.recipeIngredients.success += ingRows.length
+            const ingSql = `
+              INSERT INTO public.recipe_ingredients (
+                id, recipe_id, text, description, quantity, quantity2,
+                unit_of_measure, unit_of_measure_id, is_group_header,
+                category_id, sort_order
+              ) VALUES (
+                ${sqlVal(ing.id, "uuid")},
+                ${sqlVal(recipeId, "uuid")},
+                ${sqlVal(truncate(ing.name || ing.text || "", 500))},
+                ${sqlVal(truncate(ing.description, 500))},
+                ${sqlVal(ing.quantity != null ? Math.abs(Number(ing.quantity)) : null, "number")},
+                ${sqlVal(ing.quantity2 != null ? Math.abs(Number(ing.quantity2)) : null, "number")},
+                ${sqlVal(truncate(ing.unitOfMeasure, 200))},
+                ${sqlVal(truncate(ing.unitOfMeasureID, 200))},
+                ${sqlVal(ing.isGroupHeader || false, "boolean")},
+                ${mapIngredientCategory(ing.category_id) ? sqlVal(mapIngredientCategory(ing.category_id), "enum") : "NULL"},
+                ${sqlVal(i, "number")}
+              )
+              ON CONFLICT (id) DO NOTHING
+            `
+            await pgClient.query(ingSql)
+            counters.recipeIngredients.success++
           } catch (err: any) {
-            counters.recipeIngredients.failed += ingRows.length
-            counters.recipeIngredients.errors.push({ id: recipeId, error: err.message })
+            counters.recipeIngredients.failed++
+            counters.recipeIngredients.errors.push({
+              id: ing.id || `${recipeId}:ing-${i}`,
+              error: err.message,
+            })
           }
         }
 
-        // --- Insert instructions ---
+        // --- Insert instructions (one at a time to isolate failures) ---
         const instructions: any[] = data.instructions || []
-        const instRows: string[] = []
         for (let i = 0; i < instructions.length; i++) {
           const inst = instructions[i]
+
+          // Skip instructions with empty text — these would violate the NOT NULL
+          // constraint on public.recipe_instructions.text
+          const instText = truncate(inst.text || "", 5000)
+          if (!instText) {
+            continue
+          }
+
           // Handle image field: could be string or array of strings
           let imageUrl: string | null = null
           if (inst.image) {
             imageUrl = Array.isArray(inst.image) ? inst.image[0] || null : inst.image
           }
 
-          instRows.push(`(
-              ${sqlVal(inst.id, "uuid")},
-              ${sqlVal(recipeId, "uuid")},
-              ${sqlVal(truncate(inst.text || "", 5000))},
-              ${sqlVal(inst.isGroupHeader || false, "boolean")},
-              ${sqlVal(truncate(inst.url, 2000))},
-              ${sqlVal(truncate(imageUrl, 2000))},
-              ${sqlVal(i, "number")}
-            )`)
-        }
-
-        if (instRows.length > 0) {
           try {
-            await batchInsert(
-              "public.recipe_instructions",
-              ["id", "recipe_id", "text", "is_group_header", "url", "image_url", "sort_order"],
-              instRows,
-              "ON CONFLICT (id) DO NOTHING"
-            )
-            counters.recipeInstructions.success += instRows.length
+            const instSql = `
+              INSERT INTO public.recipe_instructions (
+                id, recipe_id, text, is_group_header, url, image_url, sort_order
+              ) VALUES (
+                ${sqlVal(inst.id, "uuid")},
+                ${sqlVal(recipeId, "uuid")},
+                ${sqlVal(instText)},
+                ${sqlVal(inst.isGroupHeader || false, "boolean")},
+                ${sqlVal(truncate(inst.url, 2000))},
+                ${sqlVal(truncate(imageUrl, 2000))},
+                ${sqlVal(i, "number")}
+              )
+              ON CONFLICT (id) DO NOTHING
+            `
+            await pgClient.query(instSql)
+            counters.recipeInstructions.success++
           } catch (err: any) {
-            counters.recipeInstructions.failed += instRows.length
-            counters.recipeInstructions.errors.push({ id: recipeId, error: err.message })
+            counters.recipeInstructions.failed++
+            counters.recipeInstructions.errors.push({
+              id: inst.id || `${recipeId}:inst-${i}`,
+              error: err.message,
+            })
           }
         }
       } catch (err: any) {

@@ -14,9 +14,6 @@
 //  181ed54d-4593-406b-af3e-cf2ea0fd0ec2
 //  17fab680-dc9a-4cb8-ac83-fd4acd27ddb6
 
-// TODO: Verify this recipes instructions got inserted correctly
-//  064666b0-214e-4a88-882b-80da8e97743e
-
 // TODO: Verify the instructions in this recipe got inserted correctly
 //   0db2928e-abcc-4c63-b3c5-9b56b6b0c017
 
@@ -725,7 +722,7 @@ async function migrateRecipes(): Promise<void> {
           const ing = ingredients[i]
 
           // Derive the text value — skip ingredients with no meaningful text
-          const ingText = truncate(ing.name || ing.text || "", 500)
+          const ingText = truncate(ing.name || ing.text || ing.description || "", 500)
           if (!ingText && !ing.isGroupHeader) {
             // Skip empty filler ingredients (no name, no text, not a group header)
             continue

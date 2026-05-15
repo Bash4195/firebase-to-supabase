@@ -680,7 +680,7 @@ async function migrateRecipes(): Promise<void> {
             ${sqlVal(cookTime.minutes, "number")},
             ${sqlVal(totalTime.hours, "number")},
             ${sqlVal(totalTime.minutes, "number")},
-            ${sqlVal(data.servings, "number")},
+            ${sqlVal(data.servings != null ? Math.abs(Number(data.servings)) : null, "number")},
             ${sqlVal(truncate(data.source?.name, 500))},
             ${sqlVal(truncate(data.source?.url, 2000))},
             ${sqlVal(authors, "jsonb")},

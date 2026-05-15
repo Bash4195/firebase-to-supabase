@@ -490,7 +490,7 @@ async function* getFirestoreBatches(
   let batchNum = 0
 
   while (true) {
-    let query = db.collection(collectionName).orderBy("_createdAt", "asc")
+    let query = db.collection(collectionName).orderBy("_created", "asc")
 
     if (lastDoc) query = query.startAfter(lastDoc)
     query = query.limit(batchSize)

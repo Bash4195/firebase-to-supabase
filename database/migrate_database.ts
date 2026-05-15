@@ -20,7 +20,7 @@
 import * as admin from "firebase-admin"
 import * as fs from "fs"
 import * as path from "path"
-import { Client } from "pg"
+import { Pool } from "pg"
 import { v4 as uuidv4 } from "uuid"
 
 import { firebaseUidToUuid } from "../helpers/firebaseUidToUuid"
@@ -51,6 +51,7 @@ if (!process.env.FIREBASE_UID_NAMESPACE) {
 // --- CLI Args ---
 const args = process.argv.slice(2)
 const BATCH_SIZE = parseInt(args[0], 10) || 50
+const CONCURRENCY = parseInt(args[1], 10) || 12
 
 // --- Initialize Firebase Admin ---
 if (!admin.apps.length) {
@@ -60,8 +61,38 @@ if (!admin.apps.length) {
 }
 const db = admin.firestore()
 
-// --- Postgres Client ---
-let pgClient: Client
+// --- Postgres Pool ---
+const pool = new Pool({
+  connectionString: SUPABASE_DB_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 15, // Tune this — 4-16 depending on your Supabase plan
+})
+
+/**
+ * Simple async concurrency limiter — no external dependency needed
+ */
+async function asyncPool<T>(
+  concurrency: number,
+  items: T[],
+  worker: (item: T, index: number) => Promise<void>
+): Promise<void> {
+  let index = 0
+  const results: Promise<void>[] = []
+
+  async function run(): Promise<void> {
+    while (index < items.length) {
+      const currentIndex = index++
+      await worker(items[currentIndex], currentIndex)
+    }
+  }
+
+  // Start `concurrency` number of workers
+  for (let i = 0; i < Math.min(concurrency, items.length); i++) {
+    results.push(run())
+  }
+
+  await Promise.all(results)
+}
 
 // --- Counters ---
 interface MigrationCounters {
@@ -533,24 +564,25 @@ async function migrateProfiles(): Promise<void> {
 
     const before = { success: counters.profiles.success, failed: counters.profiles.failed }
 
-    for (const doc of batch) {
+    await asyncPool(CONCURRENCY, batch, async (doc) => {
       const data = doc.data()
       const firebaseUid = doc.id || data.id
 
       if (!firebaseUid) {
         counters.profiles.failed++
         counters.profiles.errors.push({ id: doc.id, error: "Missing user id" })
-        continue
+        return
       }
 
       const supabaseId = firebaseUidToUuid(firebaseUid)
+      const client = await pool.connect()
 
       try {
         const agreeToTerms = validateAgreeToTerms(data.agreeToTerms) ?? [
           { version: 1, agreed: true, timestamp: new Date().toISOString() },
         ]
 
-        const sql = `
+        await client.query(`
           UPDATE public.profiles SET
             agree_to_terms = ${sqlVal(agreeToTerms, "jsonb")},
             requested_app_store_review = ${sqlVal(data.requestedAppStoreReview || false, "boolean")},
@@ -561,15 +593,15 @@ async function migrateProfiles(): Promise<void> {
             created_at = COALESCE(${sqlVal(firestoreTimestampToISO(data._created), "timestamptz")}, created_at),
             updated_at = COALESCE(${sqlVal(firestoreTimestampToISO(data._updated), "timestamptz")}, updated_at)
           WHERE id = ${sqlVal(supabaseId, "uuid")}
-        `
-
-        await pgClient.query(sql)
+        `)
         counters.profiles.success++
       } catch (err: any) {
         counters.profiles.failed++
         counters.profiles.errors.push({ id: firebaseUid, error: err.message })
+      } finally {
+        client.release()
       }
-    }
+    })
 
     console.log(`  ✓ ${counters.profiles.success - before.success} | ✗ ${counters.profiles.failed - before.failed}`)
   }
@@ -579,6 +611,7 @@ async function migrateProfiles(): Promise<void> {
 
 /**
  * Step 2: Migrate recipes (recipes + ingredients + instructions)
+ * Processes recipes concurrently within each batch using a connection pool.
  */
 async function migrateRecipes(): Promise<void> {
   console.log("\n--- Migrating Recipes ---")
@@ -599,7 +632,8 @@ async function migrateRecipes(): Promise<void> {
       instructionsFailed: counters.recipeInstructions.failed,
     }
 
-    for (const doc of batch) {
+    // --- Process recipes concurrently ---
+    await asyncPool(CONCURRENCY, batch, async (doc) => {
       const data = doc.data()
       const recipeId = doc.id || data.id
       const firebaseUserId = data.userId
@@ -607,18 +641,21 @@ async function migrateRecipes(): Promise<void> {
       if (!firebaseUserId) {
         counters.recipes.failed++
         counters.recipes.errors.push({ id: recipeId, error: "Missing userId field" })
-        continue
+        return
       }
 
       const supabaseUserId = firebaseUidToUuid(firebaseUserId)
 
+      // Grab a dedicated connection for this recipe + its children
+      const client = await pool.connect()
       try {
-        // Determine manual flag
+        // --- Build recipe INSERT ---
         const socialMediaImported = data.socialMediaImported || false
         const imageImported = data.imageImported || false
         const textImported = data.textImported || false
         const aiGenerated = data.aiGenerated || false
         const imported = data.imported || false
+        // Determine manual flag
         const manual = !socialMediaImported && !imageImported && !textImported && !aiGenerated && !imported
 
         const importedFromApp = mapImportedFromApp(data.importedFromApp)
@@ -712,11 +749,11 @@ async function migrateRecipes(): Promise<void> {
           ON CONFLICT (id) DO NOTHING
         `
 
-        await pgClient.query(recipeSql)
-        migratedRecipeIds.add(recipeId)
+        await client.query(recipeSql)
+        migratedRecipeIds.add(recipeId) // safe — unique IDs, single-threaded JS
         counters.recipes.success++
 
-        // --- Insert ingredients (batch with individual fallback) ---
+        // --- Insert ingredients (multi-row batch with individual fallback) ---
         const ingredients: any[] = data.ingredients || []
         const validIngredients: { ing: any; i: number }[] = []
         for (let i = 0; i < ingredients.length; i++) {
@@ -755,13 +792,13 @@ async function migrateRecipes(): Promise<void> {
           `
 
           try {
-            await pgClient.query(batchSql)
+            await client.query(batchSql)
             counters.recipeIngredients.success += validIngredients.length
           } catch (_batchErr) {
-            // Fall back to individual inserts — only happens for problematic rows
+            // Fall back to individual inserts
             for (const { ing, i } of validIngredients) {
               try {
-                await pgClient.query(`
+                await client.query(`
                   INSERT INTO public.recipe_ingredients (
                     id, recipe_id, text, description, quantity, quantity2,
                     unit_of_measure, unit_of_measure_id, is_group_header,
@@ -793,15 +830,14 @@ async function migrateRecipes(): Promise<void> {
           }
         }
 
-        // --- Insert instructions (batch with individual fallback) ---
+        // --- Insert instructions (multi-row batch with individual fallback) ---
         const instructions: any[] = data.instructions || []
 
         // Filter to valid instructions (non-empty text required by NOT NULL constraint)
         const validInstructions: { inst: any; i: number }[] = []
         for (let i = 0; i < instructions.length; i++) {
           const inst = instructions[i]
-          const instText = truncate(inst.text || "", 5000)
-          if (!instText) continue
+          if (!truncate(inst.text || "", 5000)) continue
           validInstructions.push({ inst, i })
         }
 
@@ -833,7 +869,7 @@ async function migrateRecipes(): Promise<void> {
           `
 
           try {
-            await pgClient.query(batchSql)
+            await client.query(batchSql)
             counters.recipeInstructions.success += validInstructions.length
           } catch (_batchErr) {
             // Fall back to individual inserts — isolates the problematic row(s)
@@ -844,7 +880,7 @@ async function migrateRecipes(): Promise<void> {
                 if (inst.image) {
                   imageUrl = Array.isArray(inst.image) ? inst.image[0] || null : inst.image
                 }
-                const instSql = `
+                await client.query(`
                   INSERT INTO public.recipe_instructions (
                     id, recipe_id, text, is_group_header, url, image_url, sort_order
                   ) VALUES (
@@ -857,8 +893,7 @@ async function migrateRecipes(): Promise<void> {
                     ${sqlVal(i, "number")}
                   )
                   ON CONFLICT (id) DO NOTHING
-                `
-                await pgClient.query(instSql)
+                `)
                 counters.recipeInstructions.success++
               } catch (err: any) {
                 counters.recipeInstructions.failed++
@@ -873,8 +908,10 @@ async function migrateRecipes(): Promise<void> {
       } catch (err: any) {
         counters.recipes.failed++
         counters.recipes.errors.push({ id: recipeId, error: err.message })
+      } finally {
+        client.release() // <-- always release back to the pool
       }
-    }
+    })
 
     console.log(
       `Recipes:       ✓ ${counters.recipes.success - before.recipes} | ✗ ${counters.recipes.failed - before.recipesFailed}`
@@ -913,7 +950,7 @@ async function migrateCollections(): Promise<void> {
       sharesFailed: counters.collectionShares.failed,
     }
 
-    for (const doc of batch) {
+    await asyncPool(CONCURRENCY, batch, async (doc) => {
       const data = doc.data()
       const collectionId = doc.id || data.id
       const firebaseUserId = data.userId
@@ -921,16 +958,17 @@ async function migrateCollections(): Promise<void> {
       if (!firebaseUserId) {
         counters.collections.failed++
         counters.collections.errors.push({ id: collectionId, error: "Missing userId field" })
-        continue
+        return
       }
 
       const supabaseUserId = firebaseUidToUuid(firebaseUserId)
+      const client = await pool.connect()
 
       try {
         const createdAt = firestoreTimestampToISO(data._created) || new Date().toISOString()
         const updatedAt = firestoreTimestampToISO(data._updated) || createdAt
 
-        const sql = `
+        await client.query(`
           INSERT INTO public.collections (id, created_at, updated_at, user_id, title)
           VALUES (
             ${sqlVal(collectionId, "uuid")},
@@ -940,8 +978,7 @@ async function migrateCollections(): Promise<void> {
             ${sqlVal(truncate(data.title || "Collection", 500))}
           )
           ON CONFLICT (id) DO NOTHING
-        `
-        await pgClient.query(sql)
+        `)
         counters.collections.success++
 
         // --- Migrate sharedWith subcollection ---
@@ -959,7 +996,7 @@ async function migrateCollections(): Promise<void> {
             const sharedWithSupabaseId = firebaseUidToUuid(sharedWithFirebaseUid)
 
             try {
-              const shareSql = `
+              await client.query(`
                 INSERT INTO public.collection_shares (
                   collection_id, shared_with_user_id, shared_with_email,
                   created_at, updated_at, permission, nickname
@@ -973,8 +1010,7 @@ async function migrateCollections(): Promise<void> {
                   ${sqlVal(truncate(shareData.nickname, 500))}
                 )
                 ON CONFLICT (collection_id, shared_with_user_id) DO NOTHING
-              `
-              await pgClient.query(shareSql)
+              `)
               counters.collectionShares.success++
             } catch (err: any) {
               // Likely FK violation if shared user wasn't migrated
@@ -985,14 +1021,16 @@ async function migrateCollections(): Promise<void> {
               })
             }
           }
-        } catch (err: any) {
-          // Subcollection might not exist for this collection
+        } catch (_subErr) {
+          // Subcollection might not exist — that's fine
         }
       } catch (err: any) {
         counters.collections.failed++
         counters.collections.errors.push({ id: collectionId, error: err.message })
+      } finally {
+        client.release()
       }
-    }
+    })
 
     console.log(
       `Collections:  ✓ ${counters.collections.success - before.collections} | ✗ ${counters.collections.failed - before.collectionsFailed}`
@@ -1003,28 +1041,31 @@ async function migrateCollections(): Promise<void> {
   }
 
   // --- Migrate collection_recipes from junction collection ---
+  // This stays sequential — the bottleneck is Firestore pagination, not Postgres
   console.log("  Migrating collection_recipes from junction collection...")
   try {
     for await (const { batch } of getFirestoreBatches(COLLECTIONS.junctionCollectionRecipes, BATCH_SIZE)) {
-      for (const jDoc of batch) {
+      // Can still use asyncPool here for the inserts within a batch
+      await asyncPool(CONCURRENCY, batch, async (jDoc) => {
         const jData = jDoc.data()
         const collectionId = jData.collectionId
         const recipeId = jData.recipeId
 
         if (!collectionId || !recipeId) {
           counters.collectionRecipes.skipped++
-          continue
+          return
         }
 
         // Only insert if the recipe was successfully migrated
         if (!migratedRecipeIds.has(recipeId)) {
           counters.collectionRecipes.skipped++
-          continue
+          return
         }
 
+        const client = await pool.connect()
         try {
           const createdAt = firestoreTimestampToISO(jData._created) || new Date().toISOString()
-          const sql = `
+          await client.query(`
             INSERT INTO public.collection_recipes (collection_id, recipe_id, created_at)
             VALUES (
               ${sqlVal(collectionId, "uuid")},
@@ -1032,14 +1073,15 @@ async function migrateCollections(): Promise<void> {
               ${sqlVal(createdAt, "timestamptz")}
             )
             ON CONFLICT (collection_id, recipe_id) DO NOTHING
-          `
-          await pgClient.query(sql)
+          `)
           counters.collectionRecipes.success++
         } catch (err: any) {
           counters.collectionRecipes.failed++
           counters.collectionRecipes.errors.push({ id: `${collectionId}:${recipeId}`, error: err.message })
+        } finally {
+          client.release()
         }
-      }
+      })
     }
   } catch (err: any) {
     console.log(`  ⚠ Could not fetch junction collection: ${err.message}`)
@@ -1077,7 +1119,7 @@ async function migrateLists(): Promise<void> {
       sharesFailed: counters.listShares.failed,
     }
 
-    for (const doc of batch) {
+    await asyncPool(CONCURRENCY, batch, async (doc) => {
       const data = doc.data()
       const listId = doc.id || data.id
       const firebaseUserId = data.userId
@@ -1085,17 +1127,18 @@ async function migrateLists(): Promise<void> {
       if (!firebaseUserId) {
         counters.lists.failed++
         counters.lists.errors.push({ id: listId, error: "Missing userId field" })
-        continue
+        return
       }
 
       const supabaseUserId = firebaseUidToUuid(firebaseUserId)
+      const client = await pool.connect()
 
       try {
         const createdAt = firestoreTimestampToISO(data._created) || new Date().toISOString()
         const updatedAt = firestoreTimestampToISO(data._updated) || createdAt
 
         // Insert list
-        const listSql = `
+        await client.query(`
           INSERT INTO public.lists (id, created_at, updated_at, user_id, title)
           VALUES (
             ${sqlVal(listId, "uuid")},
@@ -1105,51 +1148,101 @@ async function migrateLists(): Promise<void> {
             ${sqlVal(truncate(data.title || "Shopping list", 500))}
           )
           ON CONFLICT (id) DO NOTHING
-        `
-        await pgClient.query(listSql)
+        `)
         counters.lists.success++
 
-        // --- Insert list items ---
+        // --- Insert list items (multi-row batch with individual fallback) ---
         const items: any[] = data.items || []
+        const validItems: { item: any; i: number }[] = []
         for (let i = 0; i < items.length; i++) {
           const item = items[i]
-          // Resolve recipe_id FK - only set if recipe exists
-          let recipeId: string | null = item.recipe?.id || null
-          if (recipeId && !migratedRecipeIds.has(recipeId)) {
-            recipeId = null
-          }
+          const itemText = truncate(item.name || item.text || "", 500)
+          // Skip items with no meaningful text and not a group header
+          if (!itemText && !item.isGroupHeader) continue
+          validItems.push({ item, i })
+        }
+
+        if (validItems.length > 0) {
+          const valueTuples = validItems.map(({ item, i }) => {
+            // Resolve recipe_id FK — only set if recipe was migrated
+            let recipeId: string | null = item.recipe?.id || null
+            if (recipeId && !migratedRecipeIds.has(recipeId)) {
+              recipeId = null
+            }
+            return `(
+              ${sqlVal(item.id, "uuid")},
+              ${sqlVal(listId, "uuid")},
+              ${sqlVal(truncate(item.name || item.text || item.description || "", 500))},
+              ${sqlVal(truncate(item.description, 500))},
+              ${sqlVal(item.quantity != null ? Math.abs(Number(item.quantity)) : null, "number")},
+              ${sqlVal(item.quantity2 != null ? Math.abs(Number(item.quantity2)) : null, "number")},
+              ${sqlVal(truncate(item.unitOfMeasure, 200))},
+              ${sqlVal(truncate(item.unitOfMeasureID, 200))},
+              ${sqlVal(item.isGroupHeader || false, "boolean")},
+              ${sqlVal(item.checked || false, "boolean")},
+              ${mapIngredientCategory(item.category_id) ? sqlVal(mapIngredientCategory(item.category_id), "enum") : "NULL"},
+              ${sqlVal(truncate(item.notes, 5000))},
+              ${recipeId ? sqlVal(recipeId, "uuid") : "NULL"},
+              ${sqlVal(i, "number")}
+            )`
+          })
+
+          const batchSql = `
+            INSERT INTO public.list_items (
+              id, list_id, text, description,
+              quantity, quantity2,
+              unit_of_measure, unit_of_measure_id,
+              is_group_header, checked, category_id,
+              notes, recipe_id, sort_order
+            ) VALUES ${valueTuples.join(",\n")}
+            ON CONFLICT (id) DO NOTHING
+          `
 
           try {
-            const itemSql = `
-              INSERT INTO public.list_items (
-                id, list_id, text, description,
-                quantity, quantity2,
-                unit_of_measure, unit_of_measure_id,
-                is_group_header, checked, category_id,
-                notes, recipe_id, sort_order
-              ) VALUES (
-                ${sqlVal(item.id, "uuid")},
-                ${sqlVal(listId, "uuid")},
-                ${sqlVal(truncate(item.name || item.text || "", 500))},
-                ${sqlVal(truncate(item.description, 500))},
-                ${sqlVal(item.quantity != null ? Math.abs(Number(item.quantity)) : null, "number")},
-                ${sqlVal(item.quantity2 != null ? Math.abs(Number(item.quantity2)) : null, "number")},
-                ${sqlVal(truncate(item.unitOfMeasure, 200))},
-                ${sqlVal(truncate(item.unitOfMeasureID, 200))},
-                ${sqlVal(item.isGroupHeader || false, "boolean")},
-                ${sqlVal(item.checked || false, "boolean")},
-                ${mapIngredientCategory(item.category_id) ? sqlVal(mapIngredientCategory(item.category_id), "enum") : "NULL"},
-                ${sqlVal(truncate(item.notes, 5000))},
-                ${recipeId ? sqlVal(recipeId, "uuid") : "NULL"},
-                ${sqlVal(i, "number")}
-              )
-              ON CONFLICT (id) DO NOTHING
-            `
-            await pgClient.query(itemSql)
-            counters.listItems.success++
-          } catch (err: any) {
-            counters.listItems.failed++
-            counters.listItems.errors.push({ id: item.id || `${listId}:item-${i}`, error: err.message })
+            await client.query(batchSql)
+            counters.listItems.success += validItems.length
+          } catch (_batchErr) {
+            // Fall back to individual inserts
+            for (const { item, i } of validItems) {
+              try {
+                let recipeId: string | null = item.recipe?.id || null
+                if (recipeId && !migratedRecipeIds.has(recipeId)) {
+                  recipeId = null
+                }
+                await client.query(`
+                  INSERT INTO public.list_items (
+                    id, list_id, text, description,
+                    quantity, quantity2,
+                    unit_of_measure, unit_of_measure_id,
+                    is_group_header, checked, category_id,
+                    notes, recipe_id, sort_order
+                  ) VALUES (
+                    ${sqlVal(item.id, "uuid")},
+                    ${sqlVal(listId, "uuid")},
+                    ${sqlVal(truncate(item.name || item.text || item.description || "", 500))},
+                    ${sqlVal(truncate(item.description, 500))},
+                    ${sqlVal(item.quantity != null ? Math.abs(Number(item.quantity)) : null, "number")},
+                    ${sqlVal(item.quantity2 != null ? Math.abs(Number(item.quantity2)) : null, "number")},
+                    ${sqlVal(truncate(item.unitOfMeasure, 200))},
+                    ${sqlVal(truncate(item.unitOfMeasureID, 200))},
+                    ${sqlVal(item.isGroupHeader || false, "boolean")},
+                    ${sqlVal(item.checked || false, "boolean")},
+                    ${mapIngredientCategory(item.category_id) ? sqlVal(mapIngredientCategory(item.category_id), "enum") : "NULL"},
+                    ${sqlVal(truncate(item.notes, 5000))},
+                    ${recipeId ? sqlVal(recipeId, "uuid") : "NULL"},
+                    ${sqlVal(i, "number")}
+                  )
+                  ON CONFLICT (id) DO NOTHING
+                `)
+                counters.listItems.success++
+              } catch (err: any) {
+                counters.listItems.failed++
+                counters.listItems.errors.push({
+                  id: item.id || `${listId}:item-${i}`,
+                  error: err.message,
+                })
+              }
+            }
           }
         }
 
@@ -1168,7 +1261,7 @@ async function migrateLists(): Promise<void> {
             const sharedWithSupabaseId = firebaseUidToUuid(sharedWithFirebaseUid)
 
             try {
-              const shareSql = `
+              await client.query(`
                 INSERT INTO public.list_shares (
                   list_id, shared_with_user_id, shared_with_email,
                   created_at, updated_at, permission, nickname
@@ -1182,22 +1275,26 @@ async function migrateLists(): Promise<void> {
                   ${sqlVal(truncate(shareData.nickname, 500))}
                 )
                 ON CONFLICT (list_id, shared_with_user_id) DO NOTHING
-              `
-              await pgClient.query(shareSql)
+              `)
               counters.listShares.success++
             } catch (err: any) {
               counters.listShares.failed++
-              counters.listShares.errors.push({ id: `${listId}:${sharedWithFirebaseUid}`, error: err.message })
+              counters.listShares.errors.push({
+                id: `${listId}:${sharedWithFirebaseUid}`,
+                error: err.message,
+              })
             }
           }
-        } catch (err: any) {
+        } catch (_subErr) {
           // Subcollection might not exist
         }
       } catch (err: any) {
         counters.lists.failed++
         counters.lists.errors.push({ id: listId, error: err.message })
+      } finally {
+        client.release()
       }
-    }
+    })
 
     console.log(`Lists:   ✓ ${counters.lists.success - before.lists} | ✗ ${counters.lists.failed - before.listsFailed}`)
     console.log(
@@ -1238,7 +1335,7 @@ async function migrateMealPlans(): Promise<void> {
       sharesFailed: counters.mealPlanShares.failed,
     }
 
-    for (const doc of batch) {
+    await asyncPool(CONCURRENCY, batch, async (doc) => {
       const data = doc.data()
       const mealPlanId = doc.id || data.id
       const firebaseUserId = data.userId
@@ -1246,17 +1343,18 @@ async function migrateMealPlans(): Promise<void> {
       if (!firebaseUserId) {
         counters.mealPlans.failed++
         counters.mealPlans.errors.push({ id: mealPlanId, error: "Missing userId field" })
-        continue
+        return
       }
 
       const supabaseUserId = firebaseUidToUuid(firebaseUserId)
+      const client = await pool.connect()
 
       try {
         const createdAt = firestoreTimestampToISO(data._created) || new Date().toISOString()
         const updatedAt = firestoreTimestampToISO(data._updated) || createdAt
 
         // Insert meal plan
-        const mealPlanSql = `
+        await client.query(`
           INSERT INTO public.meal_plans (id, created_at, updated_at, user_id, title)
           VALUES (
             ${sqlVal(mealPlanId, "uuid")},
@@ -1266,13 +1364,15 @@ async function migrateMealPlans(): Promise<void> {
             ${sqlVal(truncate(data.title || "Meal plan", 500))}
           )
           ON CONFLICT (id) DO NOTHING
-        `
-        await pgClient.query(mealPlanSql)
+        `)
         counters.mealPlans.success++
 
-        // --- Migrate items subcollection → meal_plan_recipes ---
+        // --- Migrate items subcollection → meal_plan_recipes (multi-row batch with individual fallback) ---
         try {
           const itemDocs = await fetchSubcollection(COLLECTIONS.mealPlans, doc.id, "items")
+
+          // Filter to valid meal plan recipes
+          const validItems: { itemData: any; itemId: string }[] = []
           for (const itemDoc of itemDocs) {
             const itemData = itemDoc.data()
             const recipeId = itemData.recipe?.recipeId
@@ -1297,31 +1397,70 @@ async function migrateMealPlans(): Promise<void> {
               continue
             }
 
+            validItems.push({ itemData, itemId })
+          }
+
+          if (validItems.length > 0) {
+            const valueTuples = validItems.map(({ itemData, itemId }) => {
+              const recipeId = itemData.recipe?.recipeId
+              const dateVal = firestoreTimestampToDate(itemData.date)
+              return `(
+                ${sqlVal(itemId, "uuid")},
+                COALESCE(${sqlVal(firestoreTimestampToISO(itemData._created), "timestamptz")}, NOW()),
+                COALESCE(${sqlVal(firestoreTimestampToISO(itemData._updated), "timestamptz")}, NOW()),
+                ${sqlVal(mealPlanId, "uuid")},
+                ${sqlVal(recipeId, "uuid")},
+                ${sqlVal(dateVal, "date")},
+                ${mapMealType(itemData.mealType) ? sqlVal(mapMealType(itemData.mealType), "enum") : "NULL"},
+                ${sqlVal(truncate(itemData.note, 5000))}
+              )`
+            })
+
+            const batchSql = `
+              INSERT INTO public.meal_plan_recipes (
+                id, created_at, updated_at,
+                meal_plan_id, recipe_id, date, meal_type, notes
+              ) VALUES ${valueTuples.join(",\n")}
+              ON CONFLICT (id) DO NOTHING
+            `
+
             try {
-              const itemSql = `
-                INSERT INTO public.meal_plan_recipes (
-                  id, created_at, updated_at,
-                  meal_plan_id, recipe_id, date, meal_type, notes
-                ) VALUES (
-                  ${sqlVal(itemId, "uuid")},
-                  COALESCE(${sqlVal(firestoreTimestampToISO(itemData._created), "timestamptz")}, NOW()),
-                  COALESCE(${sqlVal(firestoreTimestampToISO(itemData._updated), "timestamptz")}, NOW()),
-                  ${sqlVal(mealPlanId, "uuid")},
-                  ${sqlVal(recipeId, "uuid")},
-                  ${sqlVal(dateVal, "date")},
-                  ${mapMealType(itemData.mealType) ? sqlVal(mapMealType(itemData.mealType), "enum") : "NULL"},
-                  ${sqlVal(truncate(itemData.note, 5000))}
-                )
-                ON CONFLICT (id) DO NOTHING
-              `
-              await pgClient.query(itemSql)
-              counters.mealPlanRecipes.success++
-            } catch (err: any) {
-              counters.mealPlanRecipes.failed++
-              counters.mealPlanRecipes.errors.push({ id: itemId, error: err.message })
+              await client.query(batchSql)
+              counters.mealPlanRecipes.success += validItems.length
+            } catch (_batchErr) {
+              // Fall back to individual inserts
+              for (const { itemData, itemId } of validItems) {
+                try {
+                  const recipeId = itemData.recipe?.recipeId
+                  const dateVal = firestoreTimestampToDate(itemData.date)
+                  await client.query(`
+                    INSERT INTO public.meal_plan_recipes (
+                      id, created_at, updated_at,
+                      meal_plan_id, recipe_id, date, meal_type, notes
+                    ) VALUES (
+                      ${sqlVal(itemId, "uuid")},
+                      COALESCE(${sqlVal(firestoreTimestampToISO(itemData._created), "timestamptz")}, NOW()),
+                      COALESCE(${sqlVal(firestoreTimestampToISO(itemData._updated), "timestamptz")}, NOW()),
+                      ${sqlVal(mealPlanId, "uuid")},
+                      ${sqlVal(recipeId, "uuid")},
+                      ${sqlVal(dateVal, "date")},
+                      ${mapMealType(itemData.mealType) ? sqlVal(mapMealType(itemData.mealType), "enum") : "NULL"},
+                      ${sqlVal(truncate(itemData.note, 5000))}
+                    )
+                    ON CONFLICT (id) DO NOTHING
+                  `)
+                  counters.mealPlanRecipes.success++
+                } catch (err: any) {
+                  counters.mealPlanRecipes.failed++
+                  counters.mealPlanRecipes.errors.push({
+                    id: itemId,
+                    error: err.message,
+                  })
+                }
+              }
             }
           }
-        } catch (err: any) {
+        } catch (_subErr) {
           // Subcollection might not exist
         }
 
@@ -1340,7 +1479,7 @@ async function migrateMealPlans(): Promise<void> {
             const sharedWithSupabaseId = firebaseUidToUuid(sharedWithFirebaseUid)
 
             try {
-              const shareSql = `
+              await client.query(`
                 INSERT INTO public.meal_plan_shares (
                   meal_plan_id, shared_with_user_id, shared_with_email,
                   created_at, updated_at, permission, nickname
@@ -1354,22 +1493,26 @@ async function migrateMealPlans(): Promise<void> {
                   ${sqlVal(truncate(shareData.nickname, 500))}
                 )
                 ON CONFLICT (meal_plan_id, shared_with_user_id) DO NOTHING
-              `
-              await pgClient.query(shareSql)
+              `)
               counters.mealPlanShares.success++
             } catch (err: any) {
               counters.mealPlanShares.failed++
-              counters.mealPlanShares.errors.push({ id: `${mealPlanId}:${sharedWithFirebaseUid}`, error: err.message })
+              counters.mealPlanShares.errors.push({
+                id: `${mealPlanId}:${sharedWithFirebaseUid}`,
+                error: err.message,
+              })
             }
           }
-        } catch (err: any) {
+        } catch (_subErr) {
           // Subcollection might not exist
         }
       } catch (err: any) {
         counters.mealPlans.failed++
         counters.mealPlans.errors.push({ id: mealPlanId, error: err.message })
+      } finally {
+        client.release()
       }
-    }
+    })
 
     console.log(
       `Meal Plans:  ✓ ${counters.mealPlans.success - before.mealPlans} | ✗ ${counters.mealPlans.failed - before.mealPlansFailed}`
@@ -1400,16 +1543,14 @@ async function main() {
   console.log("========================================")
   console.log(" Firebase → Supabase Database Migration")
   console.log("========================================")
-  console.log(`Batch size:  ${BATCH_SIZE}`)
-  console.log(`Database:    ${SUPABASE_DB_URL.replace(/:[^:@]+@/, ":***@")}`) // Redact password
+  console.log(`Batch size:   ${BATCH_SIZE}`)
+  console.log(`Concurrency:  ${CONCURRENCY}`)
+  console.log(`Pool max:     ${(pool as any).options.max} connections`)
+  console.log(`Database:     ${SUPABASE_DB_URL.replace(/:[^:@]+@/, ":***@")}`)
   console.log("")
 
-  // Connect to Postgres
-  pgClient = new Client({
-    connectionString: SUPABASE_DB_URL,
-    ssl: { rejectUnauthorized: false },
-  })
-  await pgClient.connect()
+  // Grab a connection from the pool for setup/teardown
+  const setupClient = await pool.connect()
   console.log("✓ Connected to Supabase Postgres")
 
   const startTime = Date.now()
@@ -1417,19 +1558,19 @@ async function main() {
   try {
     // Disable the paywall trigger so recipe inserts aren't blocked/counted
     console.log("\nDisabling paywall trigger...")
-    await pgClient.query(`ALTER TABLE public.recipes DISABLE TRIGGER recipes_paywall_insert`)
+    await setupClient.query(`ALTER TABLE public.recipes DISABLE TRIGGER recipes_paywall_insert`)
 
     // Disable updated_at triggers so we can preserve original timestamps
     console.log("Disabling updated_at triggers...")
-    await pgClient.query(`ALTER TABLE public.profiles DISABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.recipes DISABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.collections DISABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.lists DISABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.meal_plans DISABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.meal_plan_recipes DISABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.list_shares DISABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.collection_shares DISABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.meal_plan_shares DISABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.profiles DISABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.recipes DISABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.collections DISABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.lists DISABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.meal_plans DISABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.meal_plan_recipes DISABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.list_shares DISABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.collection_shares DISABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.meal_plan_shares DISABLE TRIGGER set_updated_at`)
 
     // Run migrations in order (respecting FK dependencies)
     await migrateProfiles()
@@ -1440,21 +1581,23 @@ async function main() {
   } finally {
     // Re-enable triggers
     console.log("\n--- Re-enabling triggers ---")
-    await pgClient.query(`ALTER TABLE public.recipes ENABLE TRIGGER recipes_paywall_insert`)
-    await pgClient.query(`ALTER TABLE public.profiles ENABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.recipes ENABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.collections ENABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.lists ENABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.meal_plans ENABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.meal_plan_recipes ENABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.list_shares ENABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.collection_shares ENABLE TRIGGER set_updated_at`)
-    await pgClient.query(`ALTER TABLE public.meal_plan_shares ENABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.recipes ENABLE TRIGGER recipes_paywall_insert`)
+    await setupClient.query(`ALTER TABLE public.profiles ENABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.recipes ENABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.collections ENABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.lists ENABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.meal_plans ENABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.meal_plan_recipes ENABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.list_shares ENABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.collection_shares ENABLE TRIGGER set_updated_at`)
+    await setupClient.query(`ALTER TABLE public.meal_plan_shares ENABLE TRIGGER set_updated_at`)
     console.log("✓ Triggers re-enabled")
+
+    setupClient.release()
   }
 
-  // Cleanup
-  await pgClient.end()
+  // Drain the pool
+  await pool.end()
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
 

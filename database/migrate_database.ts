@@ -716,91 +716,158 @@ async function migrateRecipes(): Promise<void> {
         migratedRecipeIds.add(recipeId)
         counters.recipes.success++
 
-        // --- Insert ingredients (one at a time to isolate failures) ---
+        // --- Insert ingredients (batch with individual fallback) ---
         const ingredients: any[] = data.ingredients || []
+        const validIngredients: { ing: any; i: number }[] = []
         for (let i = 0; i < ingredients.length; i++) {
           const ing = ingredients[i]
-
-          // Derive the text value — skip ingredients with no meaningful text
           const ingText = truncate(ing.name || ing.text || ing.description || "", 500)
-          if (!ingText && !ing.isGroupHeader) {
-            // Skip empty filler ingredients (no name, no text, not a group header)
-            continue
-          }
+          // Skip empty filler ingredients (no name, no text, not a group header)
+          if (!ingText && !ing.isGroupHeader) continue
+          validIngredients.push({ ing, i })
+        }
+
+        if (validIngredients.length > 0) {
+          // Try batch insert — single round-trip
+          const valueTuples = validIngredients.map(({ ing, i }) => {
+            return `(
+              ${sqlVal(ing.id || uuidv4(), "uuid")},
+              ${sqlVal(recipeId, "uuid")},
+              ${sqlVal(truncate(ing.name || ing.text || ing.description || "", 500))},
+              ${sqlVal(truncate(ing.description, 500))},
+              ${sqlVal(ing.quantity != null ? Math.abs(Number(ing.quantity)) : null, "number")},
+              ${sqlVal(ing.quantity2 != null ? Math.abs(Number(ing.quantity2)) : null, "number")},
+              ${sqlVal(truncate(ing.unitOfMeasure, 200))},
+              ${sqlVal(truncate(ing.unitOfMeasureID, 200))},
+              ${sqlVal(ing.isGroupHeader || false, "boolean")},
+              ${mapIngredientCategory(ing.category_id) ? sqlVal(mapIngredientCategory(ing.category_id), "enum") : "NULL"},
+              ${sqlVal(i, "number")}
+            )`
+          })
+
+          const batchSql = `
+            INSERT INTO public.recipe_ingredients (
+              id, recipe_id, text, description, quantity, quantity2,
+              unit_of_measure, unit_of_measure_id, is_group_header,
+              category_id, sort_order
+            ) VALUES ${valueTuples.join(",\n")}
+            ON CONFLICT (id) DO NOTHING
+          `
 
           try {
-            const ingSql = `
-              INSERT INTO public.recipe_ingredients (
-                id, recipe_id, text, description, quantity, quantity2,
-                unit_of_measure, unit_of_measure_id, is_group_header,
-                category_id, sort_order
-              ) VALUES (
-                ${sqlVal(ing.id || uuidv4(), "uuid")},
-                ${sqlVal(recipeId, "uuid")},
-                ${sqlVal(truncate(ing.name || ing.text || ing.description || "", 500))},
-                ${sqlVal(truncate(ing.description, 500))},
-                ${sqlVal(ing.quantity != null ? Math.abs(Number(ing.quantity)) : null, "number")},
-                ${sqlVal(ing.quantity2 != null ? Math.abs(Number(ing.quantity2)) : null, "number")},
-                ${sqlVal(truncate(ing.unitOfMeasure, 200))},
-                ${sqlVal(truncate(ing.unitOfMeasureID, 200))},
-                ${sqlVal(ing.isGroupHeader || false, "boolean")},
-                ${mapIngredientCategory(ing.category_id) ? sqlVal(mapIngredientCategory(ing.category_id), "enum") : "NULL"},
-                ${sqlVal(i, "number")}
-              )
-              ON CONFLICT (id) DO NOTHING
-            `
-            await pgClient.query(ingSql)
-            counters.recipeIngredients.success++
-          } catch (err: any) {
-            counters.recipeIngredients.failed++
-            counters.recipeIngredients.errors.push({
-              id: ing.id || `${recipeId}:ing-${i}`,
-              error: err.message,
-            })
+            await pgClient.query(batchSql)
+            counters.recipeIngredients.success += validIngredients.length
+          } catch (_batchErr) {
+            // Fall back to individual inserts — only happens for problematic rows
+            for (const { ing, i } of validIngredients) {
+              try {
+                await pgClient.query(`
+                  INSERT INTO public.recipe_ingredients (
+                    id, recipe_id, text, description, quantity, quantity2,
+                    unit_of_measure, unit_of_measure_id, is_group_header,
+                    category_id, sort_order
+                  ) VALUES (
+                    ${sqlVal(ing.id || uuidv4(), "uuid")},
+                    ${sqlVal(recipeId, "uuid")},
+                    ${sqlVal(truncate(ing.name || ing.text || ing.description || "", 500))},
+                    ${sqlVal(truncate(ing.description, 500))},
+                    ${sqlVal(ing.quantity != null ? Math.abs(Number(ing.quantity)) : null, "number")},
+                    ${sqlVal(ing.quantity2 != null ? Math.abs(Number(ing.quantity2)) : null, "number")},
+                    ${sqlVal(truncate(ing.unitOfMeasure, 200))},
+                    ${sqlVal(truncate(ing.unitOfMeasureID, 200))},
+                    ${sqlVal(ing.isGroupHeader || false, "boolean")},
+                    ${mapIngredientCategory(ing.category_id) ? sqlVal(mapIngredientCategory(ing.category_id), "enum") : "NULL"},
+                    ${sqlVal(i, "number")}
+                  )
+                  ON CONFLICT (id) DO NOTHING
+                `)
+                counters.recipeIngredients.success++
+              } catch (err: any) {
+                counters.recipeIngredients.failed++
+                counters.recipeIngredients.errors.push({
+                  id: ing.id || `${recipeId}:ing-${i}`,
+                  error: err.message,
+                })
+              }
+            }
           }
         }
 
-        // --- Insert instructions (one at a time to isolate failures) ---
+        // --- Insert instructions (batch with individual fallback) ---
         const instructions: any[] = data.instructions || []
+
+        // Filter to valid instructions (non-empty text required by NOT NULL constraint)
+        const validInstructions: { inst: any; i: number }[] = []
         for (let i = 0; i < instructions.length; i++) {
           const inst = instructions[i]
-
-          // Skip instructions with empty text — these would violate the NOT NULL
-          // constraint on public.recipe_instructions.text
           const instText = truncate(inst.text || "", 5000)
-          if (!instText) {
-            continue
-          }
+          if (!instText) continue
+          validInstructions.push({ inst, i })
+        }
 
-          // Handle image field: could be string or array of strings
-          let imageUrl: string | null = null
-          if (inst.image) {
-            imageUrl = Array.isArray(inst.image) ? inst.image[0] || null : inst.image
-          }
+        if (validInstructions.length > 0) {
+          // Build multi-row INSERT — single round-trip
+          const valueTuples = validInstructions.map(({ inst, i }) => {
+            const instText = truncate(inst.text || "", 5000)
+            // Handle image field: could be string or array of strings
+            let imageUrl: string | null = null
+            if (inst.image) {
+              imageUrl = Array.isArray(inst.image) ? inst.image[0] || null : inst.image
+            }
+            return `(
+              ${sqlVal(inst.id || uuidv4(), "uuid")},
+              ${sqlVal(recipeId, "uuid")},
+              ${sqlVal(instText)},
+              ${sqlVal(inst.isGroupHeader || false, "boolean")},
+              ${sqlVal(truncate(inst.url, 2000))},
+              ${sqlVal(truncate(imageUrl, 2000))},
+              ${sqlVal(i, "number")}
+            )`
+          })
+
+          const batchSql = `
+            INSERT INTO public.recipe_instructions (
+              id, recipe_id, text, is_group_header, url, image_url, sort_order
+            ) VALUES ${valueTuples.join(",\n")}
+            ON CONFLICT (id) DO NOTHING
+          `
 
           try {
-            const instSql = `
-              INSERT INTO public.recipe_instructions (
-                id, recipe_id, text, is_group_header, url, image_url, sort_order
-              ) VALUES (
-                ${sqlVal(inst.id || uuidv4(), "uuid")},
-                ${sqlVal(recipeId, "uuid")},
-                ${sqlVal(instText)},
-                ${sqlVal(inst.isGroupHeader || false, "boolean")},
-                ${sqlVal(truncate(inst.url, 2000))},
-                ${sqlVal(truncate(imageUrl, 2000))},
-                ${sqlVal(i, "number")}
-              )
-              ON CONFLICT (id) DO NOTHING
-            `
-            await pgClient.query(instSql)
-            counters.recipeInstructions.success++
-          } catch (err: any) {
-            counters.recipeInstructions.failed++
-            counters.recipeInstructions.errors.push({
-              id: inst.id || `${recipeId}:inst-${i}`,
-              error: err.message,
-            })
+            await pgClient.query(batchSql)
+            counters.recipeInstructions.success += validInstructions.length
+          } catch (_batchErr) {
+            // Fall back to individual inserts — isolates the problematic row(s)
+            for (const { inst, i } of validInstructions) {
+              try {
+                const instText = truncate(inst.text || "", 5000)
+                let imageUrl: string | null = null
+                if (inst.image) {
+                  imageUrl = Array.isArray(inst.image) ? inst.image[0] || null : inst.image
+                }
+                const instSql = `
+                  INSERT INTO public.recipe_instructions (
+                    id, recipe_id, text, is_group_header, url, image_url, sort_order
+                  ) VALUES (
+                    ${sqlVal(inst.id || uuidv4(), "uuid")},
+                    ${sqlVal(recipeId, "uuid")},
+                    ${sqlVal(instText)},
+                    ${sqlVal(inst.isGroupHeader || false, "boolean")},
+                    ${sqlVal(truncate(inst.url, 2000))},
+                    ${sqlVal(truncate(imageUrl, 2000))},
+                    ${sqlVal(i, "number")}
+                  )
+                  ON CONFLICT (id) DO NOTHING
+                `
+                await pgClient.query(instSql)
+                counters.recipeInstructions.success++
+              } catch (err: any) {
+                counters.recipeInstructions.failed++
+                counters.recipeInstructions.errors.push({
+                  id: inst.id || `${recipeId}:inst-${i}`,
+                  error: err.message,
+                })
+              }
+            }
           }
         }
       } catch (err: any) {

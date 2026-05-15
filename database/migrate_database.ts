@@ -14,6 +14,12 @@
 //  181ed54d-4593-406b-af3e-cf2ea0fd0ec2
 //  17fab680-dc9a-4cb8-ac83-fd4acd27ddb6
 
+// TODO: Verify this recipes instructions got inserted correctly
+//  064666b0-214e-4a88-882b-80da8e97743e
+
+// TODO: Verify the instructions in this recipe got inserted correctly
+//   0db2928e-abcc-4c63-b3c5-9b56b6b0c017
+
 import * as admin from "firebase-admin"
 import * as fs from "fs"
 import * as path from "path"
@@ -484,9 +490,7 @@ async function* getFirestoreBatches(
   let batchNum = 0
 
   while (true) {
-    let query = db.collection(collectionName).orderBy(
-      admin.firestore.FieldPath.documentId()
-    )
+    let query = db.collection(collectionName).orderBy("_createdAt", "asc")
 
     if (lastDoc) query = query.startAfter(lastDoc)
     query = query.limit(batchSize)

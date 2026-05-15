@@ -740,7 +740,7 @@ async function migrateRecipes(): Promise<void> {
               ) VALUES (
                 ${sqlVal(ing.id || uuidv4(), "uuid")},
                 ${sqlVal(recipeId, "uuid")},
-                ${sqlVal(truncate(ing.name || ing.text || "", 500))},
+                ${sqlVal(truncate(ing.name || ing.text || ing.description || "", 500))},
                 ${sqlVal(truncate(ing.description, 500))},
                 ${sqlVal(ing.quantity != null ? Math.abs(Number(ing.quantity)) : null, "number")},
                 ${sqlVal(ing.quantity2 != null ? Math.abs(Number(ing.quantity2)) : null, "number")},

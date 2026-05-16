@@ -824,7 +824,7 @@ async function migrateRecipes(): Promise<void> {
               } catch (err: any) {
                 counters.recipeIngredients.failed++
                 counters.recipeIngredients.errors.push({
-                  id: ing.id || `${recipeId}:ing-${i}`,
+                  id: `${recipeId}:ing-${i}`,
                   error: err.message,
                 })
               }
@@ -900,7 +900,7 @@ async function migrateRecipes(): Promise<void> {
               } catch (err: any) {
                 counters.recipeInstructions.failed++
                 counters.recipeInstructions.errors.push({
-                  id: inst.id || `${recipeId}:inst-${i}`,
+                  id: `${recipeId}:inst-${i}`,
                   error: err.message,
                 })
               }
@@ -1253,7 +1253,7 @@ async function migrateLists(): Promise<void> {
               } catch (err: any) {
                 counters.listItems.failed++
                 counters.listItems.errors.push({
-                  id: item.id || `${listId}:item-${i}`,
+                  id: `${listId}:item-${i}`,
                   error: err.message,
                 })
               }
@@ -1468,7 +1468,7 @@ async function migrateMealPlans(): Promise<void> {
                 } catch (err: any) {
                   counters.mealPlanRecipes.failed++
                   counters.mealPlanRecipes.errors.push({
-                    id: itemId,
+                    id: `${mealPlanId}:${itemId}`,
                     error: err.message,
                   })
                 }

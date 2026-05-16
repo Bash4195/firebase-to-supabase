@@ -1,8 +1,8 @@
-// This script runs at 25k users/hour
+// Migrates all Firebase Auth users to Supabase Auth.
 
 import * as fs from "fs"
 import * as path from "path"
-import { Client } from "pg"
+import { Pool } from "pg"
 import { createClient, SupabaseClient } from "@supabase/supabase-js"
 
 import { firebaseUidToUuid } from "../helpers/firebaseUidToUuid"
@@ -11,8 +11,6 @@ import { firebaseUidToUuid } from "../helpers/firebaseUidToUuid"
 const SUPABASE_URL = process.env.SUPABASE_URL!
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!
 const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL!
-
-let pgClient: Client
 
 const FIREBASE_HASH_CONFIG = {
   mem_cost: process.env.FB_MEM_COST || "14",
@@ -39,12 +37,14 @@ if (!SUPABASE_DB_URL) {
 const args = process.argv.slice(2)
 const INPUT_FILE = args[0]
 const BATCH_SIZE = parseInt(args[1], 10) || 20
+const CONCURRENCY = parseInt(args[2], 10) || 12
 
 if (!INPUT_FILE) {
-  console.log("Usage: npx ts-node migrate_auth.ts <path_to_json_file> [<batch_size>]")
+  console.log("Usage: npx ts-node migrate_auth.ts <path_to_json_file> [<batch_size>] [<concurrency>]")
   console.log("")
   console.log("  path_to_json_file  Path to the firebase auth:export JSON file")
   console.log("  batch_size         Users per batch (default: 20)")
+  console.log("  concurrency        Concurrent user migrations per batch (default: 12)")
   process.exit(1)
 }
 
@@ -54,6 +54,13 @@ const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROL
     autoRefreshToken: false,
     persistSession: false,
   },
+})
+
+// --- Postgres Pool ---
+const pool = new Pool({
+  connectionString: SUPABASE_DB_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 15,
 })
 
 // --- Types ---
@@ -85,6 +92,32 @@ interface MigrationResult {
 }
 
 // --- Helpers ---
+
+/**
+ * Simple async concurrency limiter — no external dependency needed
+ */
+async function asyncPool<T>(
+  concurrency: number,
+  items: T[],
+  worker: (item: T, index: number) => Promise<void>
+): Promise<void> {
+  let index = 0
+  const results: Promise<void>[] = []
+
+  async function run(): Promise<void> {
+    while (index < items.length) {
+      const currentIndex = index++
+      await worker(items[currentIndex], currentIndex)
+    }
+  }
+
+  // Start `concurrency` number of workers
+  for (let i = 0; i < Math.min(concurrency, items.length); i++) {
+    results.push(run())
+  }
+
+  await Promise.all(results)
+}
 
 /**
  * Convert URL-safe base64 to standard base64.
@@ -174,20 +207,13 @@ function msToISOString(ms?: string): string | null {
   return new Date(num).toISOString()
 }
 
-/**
- * Sleep helper
- */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
 // --- Migration Logic ---
 
 async function migrateUser(
   user: FirebaseUser
 ): Promise<{ success: boolean; skipped: boolean; supabaseId?: string; error?: string }> {
   if (!user.email) {
-    console.log('Skipped (no email): ', user.localId)
+    console.log("Skipped (no email): ", user.localId)
     return { success: false, skipped: true, error: "No email address" }
   }
 
@@ -201,7 +227,7 @@ async function migrateUser(
 
   try {
     const createParams: any = {
-      // We can't reuse the same user id from firebase, but we can
+      // We can't reuse the same user id from firebase, but we can use uuidv5 to create a uuid that can be reversed back into a firebase uid if needed
       id: firebaseUidToUuid(user.localId),
       email: user.email,
       email_confirm: user.emailVerified || false,
@@ -248,6 +274,7 @@ async function migrateUser(
 
 /**
  * Batch-update created_at and last_sign_in_at for migrated users via direct SQL.
+ * Uses a connection from the pool instead of a single shared client.
  */
 async function updateTimestamps(
   updates: { supabaseId: string; createdAt: string | null; lastSignedInAt: string | null }[]
@@ -255,7 +282,7 @@ async function updateTimestamps(
   if (updates.length === 0) return
 
   // Build a single UPDATE using a VALUES list
-  const valuesClauses = updates.map((u, i) => {
+  const valuesClauses = updates.map((u) => {
     const id = u.supabaseId
     const created = u.createdAt ? `'${u.createdAt}'::timestamptz` : "NULL"
     const lastSignIn = u.lastSignedInAt ? `'${u.lastSignedInAt}'::timestamptz` : "NULL"
@@ -271,10 +298,13 @@ async function updateTimestamps(
     WHERE u.id = v.id;
   `
 
+  const client = await pool.connect()
   try {
-    await pgClient.query(sql)
+    await client.query(sql)
   } catch (err: any) {
     console.error("  ⚠ Failed to update timestamps:", err.message)
+  } finally {
+    client.release()
   }
 }
 
@@ -282,9 +312,11 @@ async function main() {
   console.log("========================================")
   console.log(" Firebase → Supabase Auth Migration")
   console.log("========================================")
-  console.log(`Input file:  ${INPUT_FILE}`)
-  console.log(`Batch size:  ${BATCH_SIZE}`)
-  console.log(`Supabase:    ${SUPABASE_URL}`)
+  console.log(`Input file:   ${INPUT_FILE}`)
+  console.log(`Batch size:   ${BATCH_SIZE}`)
+  console.log(`Concurrency:  ${CONCURRENCY}`)
+  console.log(`Pool max:     ${(pool as any).options.max} connections`)
+  console.log(`Supabase:     ${SUPABASE_URL}`)
   console.log("")
 
   // Read and parse the file
@@ -305,13 +337,10 @@ async function main() {
     process.exit(1)
   }
 
-  // Connect to Postgres for timestamp updates
-  pgClient = new Client({
-    connectionString: SUPABASE_DB_URL,
-    ssl: { rejectUnauthorized: false },
-  })
-  await pgClient.connect()
-  console.log("Connected to Supabase Postgres")
+  // Verify pool connectivity
+  const testClient = await pool.connect()
+  console.log("✓ Connected to Supabase Postgres")
+  testClient.release()
   console.log("")
 
   console.log(`Found ${users.length} users to process`)
@@ -339,7 +368,8 @@ async function main() {
     let batchFailed = 0
     const timestampUpdates: { supabaseId: string; createdAt: string | null; lastSignedInAt: string | null }[] = []
 
-    for (const user of batch) {
+    // --- Process users concurrently within each batch ---
+    await asyncPool(CONCURRENCY, batch, async (user) => {
       const result = await migrateUser(user)
 
       if (result.success) {
@@ -366,22 +396,16 @@ async function main() {
           error: result.error || "Unknown error",
         })
       }
-
-      // Delay between individual requests to avoid rate limits
-      await sleep(50)
-    }
+    })
 
     // Batch-update timestamps for all successfully created users
     await updateTimestamps(timestampUpdates)
 
     console.log(`✓ ${batchSuccess} | ⊘ ${batchSkipped} | ✗ ${batchFailed}`)
-
-    // Small delay between batches
-    await sleep(200)
   }
 
-  // Cleanup
-  await pgClient.end()
+  // Drain the pool
+  await pool.end()
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
 

@@ -1,5 +1,6 @@
 // Migrates all Firestore data to Supabase Postgres.
 // Run this AFTER migrate_auth.ts has been executed (profiles are auto-created by trigger).
+// Latest script run started at 14:26 May 15
 
 // TODO: Verify the datePublished fix actually worked
 //  Check the logs and grab some ids of recipes that failed and verify it got saved in postgres
@@ -15,6 +16,7 @@
 //  17fab680-dc9a-4cb8-ac83-fd4acd27ddb6
 
 // TODO: Verify the instructions in this recipe got inserted correctly
+//   064666b0-214e-4a88-882b-80da8e97743e
 //   0db2928e-abcc-4c63-b3c5-9b56b6b0c017
 
 import * as admin from "firebase-admin"
@@ -65,7 +67,7 @@ const db = admin.firestore()
 const pool = new Pool({
   connectionString: SUPABASE_DB_URL,
   ssl: { rejectUnauthorized: false },
-  max: 15, // Tune this — 4-16 depending on your Supabase plan
+  max: 15, // This is about the max connections we can use without the project running out of disk IO throughput
 })
 
 /**
@@ -1044,7 +1046,16 @@ async function migrateCollections(): Promise<void> {
   // This stays sequential — the bottleneck is Firestore pagination, not Postgres
   console.log("  Migrating collection_recipes from junction collection...")
   try {
-    for await (const { batch } of getFirestoreBatches(COLLECTIONS.junctionCollectionRecipes, BATCH_SIZE)) {
+    for await (const { batch, batchNum } of getFirestoreBatches(COLLECTIONS.junctionCollectionRecipes, BATCH_SIZE)) {
+      const offset = totalProcessed
+      totalProcessed += batch.length
+      console.log(`  Batch ${batchNum} (${offset + 1}-${totalProcessed})...`)
+
+      const before = {
+        collectionRecipes: counters.collectionRecipes.success,
+        collectionRecipesFailed: counters.collectionRecipes.failed,
+      }
+
       // Can still use asyncPool here for the inserts within a batch
       await asyncPool(CONCURRENCY, batch, async (jDoc) => {
         const jData = jDoc.data()
@@ -1082,6 +1093,10 @@ async function migrateCollections(): Promise<void> {
           client.release()
         }
       })
+
+      console.log(
+        `Collection recipes:  ✓ ${counters.collectionRecipes.success - before.collectionRecipes} | ✗ ${counters.collectionRecipes.failed - before.collectionRecipesFailed}`
+      )
     }
   } catch (err: any) {
     console.log(`  ⚠ Could not fetch junction collection: ${err.message}`)

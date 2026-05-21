@@ -1,0 +1,10 @@
+{
+  "projects": {
+    "staging": "staging-flavorish",
+    "production": "production-flavorish",
+    "development": "dev-flavorish",
+    "default": "dev-flavorish"
+  },
+  "targets": {},
+  "etags": {}
+}

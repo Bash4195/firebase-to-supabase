@@ -29,8 +29,8 @@ if (!FIREBASE_STORAGE_BUCKET) {
   console.error("ERROR: FIREBASE_STORAGE_BUCKET must be set in .env")
   process.exit(1)
 }
-if (!process.env.FIREBASE_UID_NAMESPACE) {
-  console.error("ERROR: FIREBASE_UID_NAMESPACE must be set in .env")
+if (!process.env.FB_UID_NAMESPACE) {
+  console.error("ERROR: FB_UID_NAMESPACE must be set in .env")
   process.exit(1)
 }
 

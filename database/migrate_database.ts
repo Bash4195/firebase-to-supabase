@@ -45,8 +45,8 @@ if (!SUPABASE_DB_URL) {
   console.error("ERROR: SUPABASE_DB_URL must be set in .env")
   process.exit(1)
 }
-if (!process.env.FIREBASE_UID_NAMESPACE) {
-  console.error("ERROR: FIREBASE_UID_NAMESPACE must be set in .env")
+if (!process.env.FB_UID_NAMESPACE) {
+  console.error("ERROR: FB_UID_NAMESPACE must be set in .env")
   process.exit(1)
 }
 

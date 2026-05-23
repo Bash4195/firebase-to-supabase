@@ -130,8 +130,6 @@ async function getPasswordHashFromListUsers(firebaseUid: string): Promise<string
     const result = await admin.auth().listUsers(BATCH_SIZE, pageToken)
     const user = result.users.find((u) => u.uid === firebaseUid)
 
-    console.log("user", JSON.stringify(user))
-
     if (user?.passwordHash && user?.passwordSalt) {
       return formatFbScryptHash(user.passwordHash, user.passwordSalt)
     }
@@ -177,13 +175,6 @@ export const onUserCreate = functions.runWith({ timeoutSeconds: 540 }).auth.user
       providerData: userRecord.providerData,
       passwordHash,
     })
-
-    if (passwordHash) {
-      // Log structure without exposing the full hash in production logs
-      const parts = passwordHash.split("$")
-      console.log(`[onUserCreate] Hash parts: ${parts.length}, tag=${parts[1]}, params=${parts[2]}`)
-      console.log(`[onUserCreate] Salt length (base64): ${parts[3]?.length}, Hash length (base64): ${parts[4]?.length}`)
-    }
 
     const { data, error } = await getSupabase().auth.admin.createUser(payload)
 

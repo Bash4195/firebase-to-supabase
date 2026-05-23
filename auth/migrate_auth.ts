@@ -227,11 +227,16 @@ async function migrateUser(
 
   try {
     const createParams: any = {
-      // We can't reuse the same user id from firebase, but we can use uuidv5 to create a uuid that can be reversed back into a firebase uid if needed
       id: firebaseUidToUuid(user.localId),
       email: user.email,
-      email_confirm: user.emailVerified || false,
+      email_confirm: true,
       user_metadata: {
+        // Standard Supabase fields
+        sub: firebaseUidToUuid(user.localId),
+        email: user.email,
+        email_verified: true,
+        phone_verified: !!user.phoneNumber,
+        // Firebase custom fields
         ...(user.displayName && { full_name: user.displayName }),
         ...(user.photoUrl && { avatar_url: user.photoUrl }),
         firebase_uid: user.localId, // Keep original for reference

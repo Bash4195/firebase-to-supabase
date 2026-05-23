@@ -86,14 +86,21 @@ function buildSupabaseUserPayload(params: {
   passwordHash?: string
 }) {
   const providers = getProviders(params.providerData)
+  const supabaseUuid = firebaseUidToUuid(params.firebaseUid)
 
   const payload: Record<string, any> = {
-    id: firebaseUidToUuid(params.firebaseUid),
+    id: supabaseUuid,
     email: params.email,
-    email_confirm: params.emailVerified || false,
+    email_confirm: true,
     user_metadata: {
-      full_name: params.displayName || undefined,
-      avatar_url: params.photoURL || undefined,
+      // Standard Supabase fields (present on native sign-ups)
+      sub: supabaseUuid,
+      email: params.email,
+      email_verified: true,
+      phone_verified: false,
+      // Custom fields from Firebase
+      ...(params.displayName && { full_name: params.displayName }),
+      ...(params.photoURL && { avatar_url: params.photoURL }),
       firebase_uid: params.firebaseUid,
     },
     app_metadata: {
@@ -102,7 +109,6 @@ function buildSupabaseUserPayload(params: {
     },
   }
 
-  // Include password hash if this is an email/password user
   if (params.passwordHash) {
     payload.password_hash = params.passwordHash
   }

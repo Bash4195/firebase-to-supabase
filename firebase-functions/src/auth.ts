@@ -1,3 +1,6 @@
+// TODO: With how long the password hashing fetch takes, we need to test the speed of this function running on prod.
+//  Test this in prod
+
 import { admin } from "./admin"
 import * as functions from "firebase-functions/v1"
 import { onCall, CallableRequest } from "firebase-functions/v2/https"
@@ -12,8 +15,47 @@ import { getSupabase } from "./helpers/supabase"
 import { firebaseUidToUuid } from "./helpers/firebaseUidToUuid"
 
 // ---------------------------------------------------------------------------
+// Firebase SCRYPT hash config (must match your migration script's values)
+// ---------------------------------------------------------------------------
+const FIREBASE_HASH_CONFIG = {
+  mem_cost: process.env.FB_MEM_COST || "14",
+  rounds: process.env.FB_ROUNDS || "8",
+  salt_separator: process.env.FB_SALT_SEPARATOR || "",
+  signer_key: process.env.FB_SIGNER_KEY || "",
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Convert URL-safe base64 to standard base64.
+ * Firebase may use - and _ instead of + and /
+ */
+function urlSafeBase64ToStandard(str: string): string {
+  return str.replace(/-/g, "+").replace(/_/g, "/")
+}
+
+/**
+ * Constructs the $fbscrypt$ hash string for Supabase's encrypted_password field.
+ *
+ * Format: $fbscrypt$v=1,n=<mem_cost>,r=<rounds>,p=1,ss=<salt_separator>,sk=<signer_key>$<salt>$<hash>
+ */
+function formatFbScryptHash(passwordHash: string, salt: string): string {
+  const standardHash = urlSafeBase64ToStandard(passwordHash)
+  const standardSalt = urlSafeBase64ToStandard(salt)
+
+  const params = [
+    `v=1`,
+    `n=${FIREBASE_HASH_CONFIG.mem_cost}`,
+    `r=${FIREBASE_HASH_CONFIG.rounds}`,
+    `p=1`,
+    `ss=${FIREBASE_HASH_CONFIG.salt_separator}`,
+    `sk=${FIREBASE_HASH_CONFIG.signer_key}`,
+  ].join(",")
+
+  return `$fbscrypt$${params}$${standardSalt}$${standardHash}`
+}
 
 /**
  * Normalize Firebase provider IDs → Supabase provider names.
@@ -41,10 +83,11 @@ function buildSupabaseUserPayload(params: {
   displayName?: string
   photoURL?: string
   providerData?: Array<{ providerId: string }>
+  passwordHash?: string
 }) {
   const providers = getProviders(params.providerData)
 
-  return {
+  const payload: Record<string, any> = {
     id: firebaseUidToUuid(params.firebaseUid),
     email: params.email,
     email_confirm: params.emailVerified || false,
@@ -58,12 +101,45 @@ function buildSupabaseUserPayload(params: {
       providers,
     },
   }
+
+  // Include password hash if this is an email/password user
+  if (params.passwordHash) {
+    payload.password_hash = params.passwordHash
+  }
+
+  return payload
+}
+
+/**
+ * Firebase only exposes passwordHash/passwordSalt via listUsers().
+ * This searches for a newly-created user by paginating through the user list.
+ *
+ * ONLY call this during the transition period. Remove it after migration is complete.
+ */
+async function getPasswordHashFromListUsers(firebaseUid: string): Promise<string | undefined> {
+  const BATCH_SIZE = 1000
+  let pageToken: string | undefined
+
+  do {
+    const result = await admin.auth().listUsers(BATCH_SIZE, pageToken)
+    const user = result.users.find((u) => u.uid === firebaseUid)
+
+    console.log("user", JSON.stringify(user))
+
+    if (user?.passwordHash && user?.passwordSalt) {
+      return formatFbScryptHash(user.passwordHash, user.passwordSalt)
+    }
+
+    pageToken = result.pageToken
+  } while (pageToken)
+
+  return undefined
 }
 
 // ---------------------------------------------------------------------------
 // 1. onUserCreate — New Firebase user → Create in Supabase
 // ---------------------------------------------------------------------------
-export const onUserCreate = functions.auth.user().onCreate(async (userRecord: UserRecord) => {
+export const onUserCreate = functions.runWith({ timeoutSeconds: 540 }).auth.user().onCreate(async (userRecord: UserRecord) => {
   const firebaseUid = userRecord.uid
   const supabaseUuid = firebaseUidToUuid(firebaseUid)
 
@@ -78,6 +154,14 @@ export const onUserCreate = functions.auth.user().onCreate(async (userRecord: Us
   )
 
   try {
+    // Only listUsers for password-based sign-ups
+    const isPasswordUser = userRecord.providerData?.some((p) => p.providerId === "password")
+
+    let passwordHash: string | undefined
+    if (isPasswordUser) {
+      passwordHash = await getPasswordHashFromListUsers(firebaseUid)
+    }
+
     const payload = buildSupabaseUserPayload({
       firebaseUid,
       email: userRecord.email,
@@ -85,7 +169,15 @@ export const onUserCreate = functions.auth.user().onCreate(async (userRecord: Us
       displayName: userRecord.displayName,
       photoURL: userRecord.photoURL,
       providerData: userRecord.providerData,
+      passwordHash,
     })
+
+    if (passwordHash) {
+      // Log structure without exposing the full hash in production logs
+      const parts = passwordHash.split("$")
+      console.log(`[onUserCreate] Hash parts: ${parts.length}, tag=${parts[1]}, params=${parts[2]}`)
+      console.log(`[onUserCreate] Salt length (base64): ${parts[3]?.length}, Hash length (base64): ${parts[4]?.length}`)
+    }
 
     const { data, error } = await getSupabase().auth.admin.createUser(payload)
 
@@ -98,12 +190,20 @@ export const onUserCreate = functions.auth.user().onCreate(async (userRecord: Us
       ) {
         console.log(`[onUserCreate] User ${supabaseUuid} already exists — updating instead`)
 
-        const { error: updateError } = await getSupabase().auth.admin.updateUserById(supabaseUuid, {
+        const updatePayload: Record<string, any> = {
           email: payload.email,
           email_confirm: payload.email_confirm,
           user_metadata: payload.user_metadata,
           app_metadata: payload.app_metadata,
-        })
+        }
+
+        // Also update password hash on existing users (e.g. if they were
+        // created by an older version of this trigger that didn't include it)
+        if (passwordHash) {
+          updatePayload.password_hash = passwordHash
+        }
+
+        const { error: updateError } = await getSupabase().auth.admin.updateUserById(supabaseUuid, updatePayload)
 
         if (updateError) {
           console.error(`[onUserCreate] Failed to update existing user ${supabaseUuid}:`, updateError.message)

@@ -1,6 +1,3 @@
-// TODO: With how long the password hashing fetch takes, we need to test the speed of this function running on prod.
-//  Test this in prod
-
 import { admin } from "./admin"
 import * as functions from "firebase-functions/v1"
 import { onCall, CallableRequest } from "firebase-functions/v2/https"
@@ -122,6 +119,8 @@ function buildSupabaseUserPayload(params: {
  *
  * ONLY call this during the transition period. Remove it after migration is complete.
  */
+// NOTE: This is the only way we can get the users passwordHash/passwordSalt.
+// In prod this is taking sometimes 10-20s to run, longest run was ~52 seconds.
 async function getPasswordHashFromListUsers(firebaseUid: string): Promise<string | undefined> {
   const BATCH_SIZE = 1000
   let pageToken: string | undefined

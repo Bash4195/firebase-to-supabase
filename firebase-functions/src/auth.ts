@@ -8,33 +8,8 @@ import { auth, firestore } from "firebase-admin"
 import UserRecord = auth.UserRecord
 import QuerySnapshot = firestore.QuerySnapshot
 
-import { createClient, SupabaseClient } from "@supabase/supabase-js"
+import { getSupabase } from "./helpers/supabase"
 import { firebaseUidToUuid } from "./helpers/firebaseUidToUuid"
-
-// ---------------------------------------------------------------------------
-// Supabase Admin Client (service_role key — full auth access)
-// ---------------------------------------------------------------------------
-
-let _supabase: SupabaseClient | null = null
-
-function getSupabase(): SupabaseClient {
-  if (!_supabase) {
-    const url = process.env.SUPABASE_URL
-    const key = process.env.SUPABASE_SERVICE_ROLE_KEY
-
-    if (!url || !key) {
-      throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment")
-    }
-
-    _supabase = createClient(url, key, {
-      auth: {
-        autoRefreshToken: false,
-        persistSession: false,
-      },
-    })
-  }
-  return _supabase
-}
 
 // ---------------------------------------------------------------------------
 // Helpers

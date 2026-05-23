@@ -271,6 +271,16 @@ function truncate(str: string | null | undefined, maxLen: number): string | null
 }
 
 /**
+ * Returns a positive number, or null
+ */
+function safePositiveNumber(val: any): number | null {
+  if (val === null || val === undefined) return null
+  const num = Number(val)
+  if (isNaN(num) || !isFinite(num)) return null
+  return Math.abs(num)
+}
+
+/**
  * Map Firebase importedFromApp values to Supabase enum
  */
 function mapImportedFromApp(val: string | null | undefined): string | null {
@@ -716,7 +726,7 @@ async function migrateRecipes(): Promise<void> {
             ${sqlVal(cookTime.minutes, "number")},
             ${sqlVal(totalTime.hours, "number")},
             ${sqlVal(totalTime.minutes, "number")},
-            ${sqlVal(data.servings != null ? Math.abs(Number(data.servings)) : null, "number")},
+            ${sqlVal(safePositiveNumber(data.servings), "number")},
             ${sqlVal(truncate(data.source?.name, 500))},
             ${sqlVal(truncate(data.source?.url, 2000))},
             ${sqlVal(authors, "jsonb")},
@@ -774,8 +784,8 @@ async function migrateRecipes(): Promise<void> {
               ${sqlVal(recipeId, "uuid")},
               ${sqlVal(truncate(ing.name || ing.text || ing.description || "", 500))},
               ${sqlVal(truncate(ing.description, 500))},
-              ${sqlVal(ing.quantity != null ? Math.abs(Number(ing.quantity)) : null, "number")},
-              ${sqlVal(ing.quantity2 != null ? Math.abs(Number(ing.quantity2)) : null, "number")},
+              ${sqlVal(safePositiveNumber(ing.quantity), "number")},
+              ${sqlVal(safePositiveNumber(ing.quantity2), "number")},
               ${sqlVal(truncate(ing.unitOfMeasure, 200))},
               ${sqlVal(truncate(ing.unitOfMeasureID, 200))},
               ${sqlVal(ing.isGroupHeader || false, "boolean")},
@@ -810,8 +820,8 @@ async function migrateRecipes(): Promise<void> {
                     ${sqlVal(recipeId, "uuid")},
                     ${sqlVal(truncate(ing.name || ing.text || ing.description || "", 500))},
                     ${sqlVal(truncate(ing.description, 500))},
-                    ${sqlVal(ing.quantity != null ? Math.abs(Number(ing.quantity)) : null, "number")},
-                    ${sqlVal(ing.quantity2 != null ? Math.abs(Number(ing.quantity2)) : null, "number")},
+                    ${sqlVal(safePositiveNumber(ing.quantity), "number")},
+                    ${sqlVal(safePositiveNumber(ing.quantity2), "number")},
                     ${sqlVal(truncate(ing.unitOfMeasure, 200))},
                     ${sqlVal(truncate(ing.unitOfMeasureID, 200))},
                     ${sqlVal(ing.isGroupHeader || false, "boolean")},
@@ -1189,8 +1199,8 @@ async function migrateLists(): Promise<void> {
               ${sqlVal(listId, "uuid")},
               ${sqlVal(truncate(item.name || item.text || item.description || "", 500))},
               ${sqlVal(truncate(item.description, 500))},
-              ${sqlVal(item.quantity != null ? Math.abs(Number(item.quantity)) : null, "number")},
-              ${sqlVal(item.quantity2 != null ? Math.abs(Number(item.quantity2)) : null, "number")},
+              ${sqlVal(safePositiveNumber(item.quantity), "number")},
+              ${sqlVal(safePositiveNumber(item.quantity2), "number")},
               ${sqlVal(truncate(item.unitOfMeasure, 200))},
               ${sqlVal(truncate(item.unitOfMeasureID, 200))},
               ${sqlVal(item.isGroupHeader || false, "boolean")},
@@ -1236,8 +1246,8 @@ async function migrateLists(): Promise<void> {
                     ${sqlVal(listId, "uuid")},
                     ${sqlVal(truncate(item.name || item.text || item.description || "", 500))},
                     ${sqlVal(truncate(item.description, 500))},
-                    ${sqlVal(item.quantity != null ? Math.abs(Number(item.quantity)) : null, "number")},
-                    ${sqlVal(item.quantity2 != null ? Math.abs(Number(item.quantity2)) : null, "number")},
+                    ${sqlVal(safePositiveNumber(item.quantity), "number")},
+                    ${sqlVal(safePositiveNumber(item.quantity2), "number")},
                     ${sqlVal(truncate(item.unitOfMeasure, 200))},
                     ${sqlVal(truncate(item.unitOfMeasureID, 200))},
                     ${sqlVal(item.isGroupHeader || false, "boolean")},

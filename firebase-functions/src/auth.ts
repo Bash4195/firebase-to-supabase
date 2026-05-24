@@ -114,6 +114,30 @@ function buildSupabaseUserPayload(params: {
 }
 
 /**
+ * Write last_sign_in_at directly to auth.users.
+ *
+ * GoTrue does NOT allow setting this field through the admin API — we must
+ * bypass it with a Postgres function that has SECURITY DEFINER privileges.
+ */
+async function setLastSignInAt(supabaseUuid: string, lastSignInTime: string): Promise<void> {
+  // Firebase metadata.lastSignInTime is in RFC 1123 format:
+  //   "Wed, 01 Oct 2020 00:00:00 GMT"
+  // Convert to ISO 8601 so Postgres timestamptz parses it correctly.
+  const isoTimestamp = new Date(lastSignInTime).toISOString()
+
+  const { error } = await getSupabase().rpc("set_last_sign_in_at", {
+    user_id: supabaseUuid,
+    last_sign_in: isoTimestamp,
+  })
+
+  if (error) {
+    console.error(`[setLastSignInAt] Failed to update last_sign_in_at for ${supabaseUuid}:`, error.message)
+  } else {
+    console.log(`[setLastSignInAt] ✓ Set last_sign_in_at = ${isoTimestamp} for ${supabaseUuid}`)
+  }
+}
+
+/**
  * Firebase only exposes passwordHash/passwordSalt via listUsers().
  * This searches for a newly-created user by paginating through the user list.
  *
@@ -205,6 +229,11 @@ export const onUserCreate = functions.runWith({ timeoutSeconds: 540 }).auth.user
           console.error(`[onUserCreate] Failed to update existing user ${supabaseUuid}:`, updateError.message)
         } else {
           console.log(`[onUserCreate] Updated existing user ${supabaseUuid}`)
+
+          // Set last_sign_in_at via Postgres function (GoTrue won't accept it)
+          if (userRecord.metadata.lastSignInTime) {
+            await setLastSignInAt(supabaseUuid, userRecord.metadata.lastSignInTime)
+          }
         }
         return
       }
@@ -214,6 +243,11 @@ export const onUserCreate = functions.runWith({ timeoutSeconds: 540 }).auth.user
     }
 
     console.log(`[onUserCreate] ✓ Created Supabase user ${data.user?.id}`)
+
+    // Set last_sign_in_at via Postgres function (GoTrue won't accept it)
+    if (userRecord.metadata.lastSignInTime) {
+      await setLastSignInAt(supabaseUuid, userRecord.metadata.lastSignInTime)
+    }
   } catch (err: any) {
     console.error(`[onUserCreate] Unexpected error for ${firebaseUid}:`, err.message || err)
   }

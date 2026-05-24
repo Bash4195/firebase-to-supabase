@@ -166,92 +166,96 @@ async function getPasswordHashFromListUsers(firebaseUid: string): Promise<string
 // ---------------------------------------------------------------------------
 // 1. onUserCreate — New Firebase user → Create in Supabase
 // ---------------------------------------------------------------------------
-export const onUserCreate = functions.runWith({ timeoutSeconds: 540 }).auth.user().onCreate(async (userRecord: UserRecord) => {
-  const firebaseUid = userRecord.uid
-  const supabaseUuid = firebaseUidToUuid(firebaseUid)
+export const onUserCreate = functions
+  .runWith({ timeoutSeconds: 540 })
+  .auth.user()
+  .onCreate(async (userRecord: UserRecord) => {
+    const firebaseUid = userRecord.uid
+    const supabaseUuid = firebaseUidToUuid(firebaseUid)
 
-  // Skip users without an email
-  if (!userRecord.email) {
-    console.log(`[onUserCreate] Skipping user ${firebaseUid} — no email address`)
-    return
-  }
-
-  console.log(
-    `[onUserCreate] Creating Supabase user ${supabaseUuid} ` + `(Firebase: ${firebaseUid}, email: ${userRecord.email})`
-  )
-
-  try {
-    // Only listUsers for password-based sign-ups
-    const isPasswordUser = userRecord.providerData?.some((p) => p.providerId === "password")
-
-    let passwordHash: string | undefined
-    if (isPasswordUser) {
-      passwordHash = await getPasswordHashFromListUsers(firebaseUid)
-    }
-
-    const payload = buildSupabaseUserPayload({
-      firebaseUid,
-      email: userRecord.email,
-      emailVerified: userRecord.emailVerified,
-      displayName: userRecord.displayName,
-      photoURL: userRecord.photoURL,
-      providerData: userRecord.providerData,
-      passwordHash,
-    })
-
-    const { data, error } = await getSupabase().auth.admin.createUser(payload)
-
-    if (error) {
-      // User may already exist from migration → update instead
-      if (
-        error.message?.includes("already been registered") ||
-        error.message?.includes("already exists") ||
-        error.message?.includes("duplicate")
-      ) {
-        console.log(`[onUserCreate] User ${supabaseUuid} already exists — updating instead`)
-
-        const updatePayload: Record<string, any> = {
-          email: payload.email,
-          email_confirm: payload.email_confirm,
-          user_metadata: payload.user_metadata,
-          app_metadata: payload.app_metadata,
-        }
-
-        // Also update password hash on existing users (e.g. if they were
-        // created by an older version of this trigger that didn't include it)
-        if (passwordHash) {
-          updatePayload.password_hash = passwordHash
-        }
-
-        const { error: updateError } = await getSupabase().auth.admin.updateUserById(supabaseUuid, updatePayload)
-
-        if (updateError) {
-          console.error(`[onUserCreate] Failed to update existing user ${supabaseUuid}:`, updateError.message)
-        } else {
-          console.log(`[onUserCreate] Updated existing user ${supabaseUuid}`)
-
-          // Set last_sign_in_at via Postgres function (GoTrue won't accept it)
-          if (userRecord.metadata.lastSignInTime) {
-            await setLastSignInAt(supabaseUuid, userRecord.metadata.lastSignInTime)
-          }
-        }
-        return
-      }
-
-      console.error(`[onUserCreate] Failed to create user ${supabaseUuid}:`, error.message)
+    // Skip users without an email
+    if (!userRecord.email) {
+      console.log(`[onUserCreate] Skipping user ${firebaseUid} — no email address`)
       return
     }
 
-    console.log(`[onUserCreate] ✓ Created Supabase user ${data.user?.id}`)
+    console.log(
+      `[onUserCreate] Creating Supabase user ${supabaseUuid} ` +
+        `(Firebase: ${firebaseUid}, email: ${userRecord.email})`
+    )
 
-    // Set last_sign_in_at via Postgres function (GoTrue won't accept it)
-    if (userRecord.metadata.lastSignInTime) {
-      await setLastSignInAt(supabaseUuid, userRecord.metadata.lastSignInTime)
+    try {
+      // Only listUsers for password-based sign-ups
+      const isPasswordUser = userRecord.providerData?.some((p) => p.providerId === "password")
+
+      let passwordHash: string | undefined
+      if (isPasswordUser) {
+        passwordHash = await getPasswordHashFromListUsers(firebaseUid)
+      }
+
+      const payload = buildSupabaseUserPayload({
+        firebaseUid,
+        email: userRecord.email,
+        emailVerified: userRecord.emailVerified,
+        displayName: userRecord.displayName,
+        photoURL: userRecord.photoURL,
+        providerData: userRecord.providerData,
+        passwordHash,
+      })
+
+      const { data, error } = await getSupabase().auth.admin.createUser(payload)
+
+      if (error) {
+        // User may already exist from migration → update instead
+        if (
+          error.message?.includes("already been registered") ||
+          error.message?.includes("already exists") ||
+          error.message?.includes("duplicate")
+        ) {
+          console.log(`[onUserCreate] User ${supabaseUuid} already exists — updating instead`)
+
+          const updatePayload: Record<string, any> = {
+            email: payload.email,
+            email_confirm: payload.email_confirm,
+            user_metadata: payload.user_metadata,
+            app_metadata: payload.app_metadata,
+          }
+
+          // Also update password hash on existing users (e.g. if they were
+          // created by an older version of this trigger that didn't include it)
+          if (passwordHash) {
+            updatePayload.password_hash = passwordHash
+          }
+
+          const { error: updateError } = await getSupabase().auth.admin.updateUserById(supabaseUuid, updatePayload)
+
+          if (updateError) {
+            console.error(`[onUserCreate] Failed to update existing user ${supabaseUuid}:`, updateError.message)
+          } else {
+            console.log(`[onUserCreate] Updated existing user ${supabaseUuid}`)
+
+            // Set last_sign_in_at via Postgres function (GoTrue won't accept it)
+            if (userRecord.metadata.lastSignInTime) {
+              await setLastSignInAt(supabaseUuid, userRecord.metadata.lastSignInTime)
+            }
+          }
+          return
+        }
+
+        console.error(`[onUserCreate] Failed to create user ${supabaseUuid}:`, error.message)
+        return
+      }
+
+      console.log(`[onUserCreate] ✓ Created Supabase user ${data.user?.id}`)
+
+      // Set last_sign_in_at via Postgres function (GoTrue won't accept it)
+      if (userRecord.metadata.lastSignInTime) {
+        await setLastSignInAt(supabaseUuid, userRecord.metadata.lastSignInTime)
+      }
+    } catch (err: any) {
+      console.error(`[onUserCreate] Unexpected error for ${firebaseUid}:`, err.message || err)
     }
-  } catch (err: any) {
-    console.error(`[onUserCreate] Unexpected error for ${firebaseUid}:`, err.message || err)
-  }
-})
+  })
 
 // ---------------------------------------------------------------------------
 // 2. onUserDelete — Firebase user deleted → Delete from Supabase

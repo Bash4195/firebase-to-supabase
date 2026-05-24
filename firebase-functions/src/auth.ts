@@ -163,6 +163,39 @@ async function getPasswordHashFromListUsers(firebaseUid: string): Promise<string
   return undefined
 }
 
+/**
+ * Fetches the Firebase scrypt password hash via listUsers() and writes it
+ * directly to Supabase auth.users via the update_user_password_hash RPC.
+ *
+ * This runs AFTER the user has already been created in Supabase so the user
+ * is immediately available — password login just won't work until this completes.
+ */
+async function fetchAndSetPasswordHash(firebaseUid: string, supabaseUuid: string): Promise<void> {
+  try {
+    console.log(`[fetchAndSetPasswordHash] Fetching password hash for ${firebaseUid}...`)
+
+    const passwordHash = await getPasswordHashFromListUsers(firebaseUid)
+
+    if (!passwordHash) {
+      console.warn(`[fetchAndSetPasswordHash] No password hash found for ${firebaseUid}`)
+      return
+    }
+
+    const { error } = await getSupabase().rpc("update_user_password_hash", {
+      target_user_id: supabaseUuid,
+      new_password_hash: passwordHash,
+    })
+
+    if (error) {
+      console.error(`[fetchAndSetPasswordHash] Failed to set password hash for ${supabaseUuid}:`, error.message)
+    } else {
+      console.log(`[fetchAndSetPasswordHash] ✓ Password hash set for ${supabaseUuid}`)
+    }
+  } catch (err: any) {
+    console.error(`[fetchAndSetPasswordHash] Unexpected error for ${firebaseUid}:`, err.message || err)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 1. onUserCreate — New Firebase user → Create in Supabase
 // ---------------------------------------------------------------------------
@@ -188,11 +221,7 @@ export const onUserCreate = functions
       // Only listUsers for password-based sign-ups
       const isPasswordUser = userRecord.providerData?.some((p) => p.providerId === "password")
 
-      let passwordHash: string | undefined
-      if (isPasswordUser) {
-        passwordHash = await getPasswordHashFromListUsers(firebaseUid)
-      }
-
+      // Build payload WITHOUT password — we'll set it later via RPC
       const payload = buildSupabaseUserPayload({
         firebaseUid,
         email: userRecord.email,
@@ -200,7 +229,6 @@ export const onUserCreate = functions
         displayName: userRecord.displayName,
         photoURL: userRecord.photoURL,
         providerData: userRecord.providerData,
-        passwordHash,
       })
 
       const { data, error } = await getSupabase().auth.admin.createUser(payload)
@@ -221,12 +249,6 @@ export const onUserCreate = functions
             app_metadata: payload.app_metadata,
           }
 
-          // Also update password hash on existing users (e.g. if they were
-          // created by an older version of this trigger that didn't include it)
-          if (passwordHash) {
-            updatePayload.password_hash = passwordHash
-          }
-
           const { error: updateError } = await getSupabase().auth.admin.updateUserById(supabaseUuid, updatePayload)
 
           if (updateError) {
@@ -239,6 +261,12 @@ export const onUserCreate = functions
               await setLastSignInAt(supabaseUuid, userRecord.metadata.lastSignInTime)
             }
           }
+
+          // Still attempt to set the password hash for existing users too
+          if (isPasswordUser) {
+            await fetchAndSetPasswordHash(firebaseUid, supabaseUuid)
+          }
+
           return
         }
 
@@ -251,6 +279,11 @@ export const onUserCreate = functions
       // Set last_sign_in_at via Postgres function (GoTrue won't accept it)
       if (userRecord.metadata.lastSignInTime) {
         await setLastSignInAt(supabaseUuid, userRecord.metadata.lastSignInTime)
+      }
+
+      // Now fetch the password hash in the background and update via RPC
+      if (isPasswordUser) {
+        await fetchAndSetPasswordHash(firebaseUid, supabaseUuid)
       }
     } catch (err: any) {
       console.error(`[onUserCreate] Unexpected error for ${firebaseUid}:`, err.message || err)

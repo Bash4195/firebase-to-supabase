@@ -10,6 +10,9 @@ const { onJunctionCollectionRecipeCreate, onJunctionCollectionRecipeDelete } = r
 const { onCollectionShareCreate, onCollectionShareUpdate, onCollectionShareDelete } = require("./collection_shares")
 const { onListCreate, onListUpdate, onListDelete } = require("./lists")
 const { onListShareCreate, onListShareUpdate, onListShareDelete } = require("./list_shares")
+const { onMealPlanCreate, onMealPlanUpdate, onMealPlanDelete } = require("./meal_plans")
+const { onMealPlanItemCreate, onMealPlanItemUpdate, onMealPlanItemDelete } = require("./meal_plan_items")
+const { onMealPlanShareCreate, onMealPlanShareUpdate, onMealPlanShareDelete } = require("./meal_plan_shares")
 
 // Auth
 exports.onUserCreate = onUserCreate
@@ -44,3 +47,18 @@ exports.onListDelete = onListDelete
 exports.onListShareCreate = onListShareCreate
 exports.onListShareUpdate = onListShareUpdate
 exports.onListShareDelete = onListShareDelete
+
+// Meal plans
+exports.onMealPlanCreate = onMealPlanCreate
+exports.onMealPlanUpdate = onMealPlanUpdate
+exports.onMealPlanDelete = onMealPlanDelete
+
+// Meal plan recipes
+exports.onMealPlanItemCreate = onMealPlanItemCreate
+exports.onMealPlanItemUpdate = onMealPlanItemUpdate
+exports.onMealPlanItemDelete = onMealPlanItemDelete
+
+// Meal plan shares
+exports.onMealPlanShareCreate = onMealPlanShareCreate
+exports.onMealPlanShareUpdate = onMealPlanShareUpdate
+exports.onMealPlanShareDelete = onMealPlanShareDelete

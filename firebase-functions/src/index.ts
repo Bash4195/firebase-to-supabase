@@ -4,6 +4,8 @@ const { initializeApp } = require("firebase-admin/app")
 initializeApp()
 
 const { onUserCreate, onUserDelete, changeUserEmail } = require("./auth")
+
+const { onProfileUpdate } = require("./users")
 const { onRecipeCreate, onRecipeUpdate, onRecipeDelete } = require("./recipes")
 const { onCollectionCreate, onCollectionUpdate, onCollectionDelete } = require("./collections")
 const { onJunctionCollectionRecipeCreate, onJunctionCollectionRecipeDelete } = require("./junction_collection_recipes")
@@ -18,6 +20,9 @@ const { onMealPlanShareCreate, onMealPlanShareUpdate, onMealPlanShareDelete } = 
 exports.onUserCreate = onUserCreate
 exports.onUserDelete = onUserDelete
 exports.changeUserEmail = changeUserEmail
+
+// Users
+exports.onProfileUpdate = onProfileUpdate
 
 // Recipes
 exports.onRecipeCreate = onRecipeCreate

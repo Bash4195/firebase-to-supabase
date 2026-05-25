@@ -286,13 +286,16 @@ async function updateTimestamps(
 ): Promise<void> {
   if (updates.length === 0) return
 
-  // Build a single UPDATE using a VALUES list
-  const valuesClauses = updates.map((u) => {
-    const id = u.supabaseId
-    const created = u.createdAt ? `'${u.createdAt}'::timestamptz` : "NULL"
-    const lastSignIn = u.lastSignedInAt ? `'${u.lastSignedInAt}'::timestamptz` : "NULL"
-    return `('${id}'::uuid, ${created}, ${lastSignIn})`
-  })
+  const valuesClauses: string[] = []
+  const queryParams: any[] = []
+  let paramIndex = 1
+
+  for (const u of updates) {
+    // Use $1, $2, $3 placeholders
+    valuesClauses.push(`($${paramIndex}::uuid, $${paramIndex + 1}::timestamptz, $${paramIndex + 2}::timestamptz)`)
+    queryParams.push(u.supabaseId, u.createdAt, u.lastSignedInAt)
+    paramIndex += 3
+  }
 
   const sql = `
     UPDATE auth.users AS u
@@ -305,7 +308,7 @@ async function updateTimestamps(
 
   const client = await pool.connect()
   try {
-    await client.query(sql)
+    await client.query(sql, queryParams) // Pass params as the second argument
   } catch (err: any) {
     console.error("  ⚠ Failed to update timestamps:", err.message)
   } finally {

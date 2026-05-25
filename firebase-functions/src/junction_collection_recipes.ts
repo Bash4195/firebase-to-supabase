@@ -1,3 +1,4 @@
+import { admin } from "./admin"
 import * as functions from "firebase-functions/v1"
 
 import { getSupabase } from "./helpers/supabase"

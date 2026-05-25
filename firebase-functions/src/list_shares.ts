@@ -8,11 +8,11 @@ import { firestoreTimestampToISO, mapSharePermission, truncate } from "./helpers
 // ============================================================================
 // Row builder
 // ============================================================================
-function buildShareRow(collectionId: string, data: any) {
+function buildShareRow(listId: string, data: any) {
   const sharedWithSupabaseId = firebaseUidToUuid(data.id)
 
   return {
-    collection_id: collectionId,
+    list_id: listId,
     shared_with_user_id: sharedWithSupabaseId,
     shared_with_email: data.email || null,
     created_at: firestoreTimestampToISO(data._created) || new Date().toISOString(),
@@ -23,68 +23,67 @@ function buildShareRow(collectionId: string, data: any) {
 }
 
 // ============================================================================
-// 1. onCreate — New share → Insert into collection_shares
+// 1. onCreate — New share → Insert into list_shares
 // ============================================================================
-export const onCollectionShareCreate = functions.firestore
-  .document("collections/{collectionId}/sharedWith/{sharedWithId}")
+export const onListShareCreate = functions.firestore
+  .document("lists/{listId}/sharedWith/{sharedWithId}")
   .onCreate(async (snapshot, context) => {
     const data = snapshot.data()
-    const collectionId = context.params.collectionId
+    const listId = context.params.listId
     const sharedWithFirebaseId = context.params.sharedWithId
 
     if (!data.id) {
-      console.error(`[onCollectionShareCreate] Share ${sharedWithFirebaseId} missing id field — skipping`)
+      console.error(`[onListShareCreate] Share ${sharedWithFirebaseId} missing id field — skipping`)
       return
     }
 
-    console.log(`[onCollectionShareCreate] Syncing share of collection ${collectionId} to user ${sharedWithFirebaseId}`)
+    console.log(`[onListShareCreate] Syncing share of list ${listId} to user ${sharedWithFirebaseId}`)
 
     try {
       const supabase = getSupabase()
-      const row = buildShareRow(collectionId, data)
+      const row = buildShareRow(listId, data)
 
-      const { error } = await supabase.from("collection_shares").insert(row)
+      const { error } = await supabase.from("list_shares").insert(row)
 
       if (error) {
         // 23505 = duplicate key — share already exists (backfill race)
         if (error.code === "23505") {
-          console.log(`[onCollectionShareCreate] Share already exists — skipping`)
+          console.log(`[onListShareCreate] Share already exists — skipping`)
           return
         }
-        // 23503 = FK violation — collection not yet in Supabase or shared-with user not yet migrated
+        // 23503 = FK violation — list not yet in Supabase or shared-with user not yet migrated
         if (error.code === "23503") {
           console.log(
-            `[onCollectionShareCreate] FK violation — collection or user not yet in Supabase. ` +
-              `Will be picked up by backfill.`
+            `[onListShareCreate] FK violation — list or user not yet in Supabase. ` + `Will be picked up by backfill.`
           )
           return
         }
-        console.error(`[onCollectionShareCreate] Failed to insert share:`, error.message)
+        console.error(`[onListShareCreate] Failed to insert share:`, error.message)
         return
       }
 
-      console.log(`[onCollectionShareCreate] ✓ Synced share of collection ${collectionId} to ${sharedWithFirebaseId}`)
+      console.log(`[onListShareCreate] ✓ Synced share of list ${listId} to ${sharedWithFirebaseId}`)
     } catch (err: any) {
-      console.error(`[onCollectionShareCreate] Unexpected error:`, err.message || err)
+      console.error(`[onListShareCreate] Unexpected error:`, err.message || err)
     }
   })
 
 // ============================================================================
 // 2. onUpdate — Share modified → Update Supabase (or insert if missing)
 // ============================================================================
-export const onCollectionShareUpdate = functions.firestore
-  .document("collections/{collectionId}/sharedWith/{sharedWithId}")
+export const onListShareUpdate = functions.firestore
+  .document("lists/{listId}/sharedWith/{sharedWithId}")
   .onUpdate(async (change, context) => {
     const data = change.after.data()
-    const collectionId = context.params.collectionId
+    const listId = context.params.listId
     const sharedWithFirebaseId = context.params.sharedWithId
 
     if (!data.id) {
-      console.error(`[onCollectionShareUpdate] Share ${sharedWithFirebaseId} missing id field — skipping`)
+      console.error(`[onListShareUpdate] Share ${sharedWithFirebaseId} missing id field — skipping`)
       return
     }
 
-    console.log(`[onCollectionShareUpdate] Syncing share of collection ${collectionId} to ${sharedWithFirebaseId}`)
+    console.log(`[onListShareUpdate] Syncing share of list ${listId} to ${sharedWithFirebaseId}`)
 
     try {
       const supabase = getSupabase()
@@ -99,72 +98,72 @@ export const onCollectionShareUpdate = functions.firestore
       }
 
       const { data: updated, error: updateError } = await supabase
-        .from("collection_shares")
+        .from("list_shares")
         .update(updatePayload)
-        .eq("collection_id", collectionId)
+        .eq("list_id", listId)
         .eq("shared_with_user_id", sharedWithSupabaseId)
-        .select("collection_id")
+        .select("list_id")
 
       if (updateError) {
-        console.error(`[onCollectionShareUpdate] Failed to update share:`, updateError.message)
+        console.error(`[onListShareUpdate] Failed to update share:`, updateError.message)
         return
       }
 
       if (!updated || updated.length === 0) {
-        console.log(`[onCollectionShareUpdate] Share not found in Supabase — inserting instead`)
+        console.log(`[onListShareUpdate] Share not found in Supabase — inserting instead`)
 
         // Fall back to insert in case the backfill hasn't reached this document yet
-        const insertRow = buildShareRow(collectionId, data)
-        const { error: insertError } = await supabase.from("collection_shares").insert(insertRow)
+        const insertRow = buildShareRow(listId, data)
+        const { error: insertError } = await supabase.from("list_shares").insert(insertRow)
 
         if (insertError && insertError.code !== "23505" && insertError.code !== "23503") {
-          console.error(`[onCollectionShareUpdate] Failed to insert share:`, insertError.message)
+          console.error(`[onListShareUpdate] Failed to insert share:`, insertError.message)
         }
         return
       }
 
-      console.log(`[onCollectionShareUpdate] ✓ Synced share of collection ${collectionId} to ${sharedWithFirebaseId}`)
+      console.log(`[onListShareUpdate] ✓ Synced share of list ${listId} to ${sharedWithFirebaseId}`)
     } catch (err: any) {
-      console.error(`[onCollectionShareUpdate] Unexpected error:`, err.message || err)
+      console.error(`[onListShareUpdate] Unexpected error:`, err.message || err)
     }
   })
 
 // ============================================================================
 // 3. onDelete — Share removed → Delete from Supabase
 // ============================================================================
-export const onCollectionShareDelete = functions.firestore
-  .document("collections/{collectionId}/sharedWith/{sharedWithId}")
+export const onListShareDelete = functions.firestore
+  .document("lists/{listId}/sharedWith/{sharedWithId}")
   .onDelete(async (snapshot, context) => {
     const data = snapshot.data()
-    const collectionId = context.params.collectionId
+    const listId = context.params.listId
     const sharedWithFirebaseId = context.params.sharedWithId
 
     if (!data.id) {
       // Fall back to the path parameter if the data.id field is missing
-      console.warn(`[onCollectionShareDelete] Share ${sharedWithFirebaseId} missing id field — using path parameter`)
+      console.warn(`[onListShareDelete] Share ${sharedWithFirebaseId} missing id field — using path parameter`)
     }
 
     const firebaseUid = data.id || sharedWithFirebaseId
     const sharedWithSupabaseId = firebaseUidToUuid(firebaseUid)
 
-    console.log(`[onCollectionShareDelete] Removing share of collection ${collectionId} from ${firebaseUid}`)
+    console.log(`[onListShareDelete] Removing share of list ${listId} from ${firebaseUid}`)
 
     try {
       const supabase = getSupabase()
 
       const { error } = await supabase
-        .from("collection_shares")
+        .from("list_shares")
         .delete()
-        .eq("collection_id", collectionId)
+        .eq("list_id", listId)
         .eq("shared_with_user_id", sharedWithSupabaseId)
 
       if (error) {
-        console.error(`[onCollectionShareDelete] Failed to delete share:`, error.message)
+        console.error(`[onListShareDelete] Failed to delete share:`, error.message)
         return
       }
 
-      console.log(`[onCollectionShareDelete] ✓ Removed share of collection ${collectionId} from ${firebaseUid}`)
+      console.log(`[onListShareDelete] ✓ Removed share of list ${listId} from ${firebaseUid}`)
     } catch (err: any) {
-      console.error(`[onCollectionShareDelete] Unexpected error:`, err.message || err)
+      console.error(`[onListShareDelete] Unexpected error:`, err.message || err)
     }
   })

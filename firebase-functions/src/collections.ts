@@ -1,6 +1,5 @@
 import { admin } from "./admin"
 import * as functions from "firebase-functions/v1"
-import { v4 as uuidv4 } from "uuid"
 
 import { getSupabase } from "./helpers/supabase"
 import { firebaseUidToUuid } from "./helpers/firebaseUidToUuid"

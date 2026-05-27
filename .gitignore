@@ -8,6 +8,7 @@ auth/users-*
 
 database/firebase-service-accounts
 database/migration_errors.json
+database/single_recipe_migration_results.json
 
 storage/storage_migration_errors.json
 

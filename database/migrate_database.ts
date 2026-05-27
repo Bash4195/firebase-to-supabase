@@ -1,23 +1,5 @@
 // Migrates all Firestore data to Supabase Postgres.
 // Run this AFTER migrate_auth.ts has been executed (profiles are auto-created by trigger).
-// Latest script run started at 14:26 May 15
-
-// TODO: Verify the datePublished fix actually worked
-//  Check the logs and grab some ids of recipes that failed and verify it got saved in postgres
-//  IDs already found:
-//  18e63030-1abf-439d-890a-220592fee630
-//  19013ba4-c4a4-4a58-b4ca-28dc7aac4360
-//  18e03911-7b46-42d4-b356-ea4218f9862d
-//  18dc48e4-ab8d-4ef7-9be4-d438a5ae35d0
-//  18cae324-d0db-40b0-9f54-8d4b7ae494af
-//  18a4eb4c-b24a-41ab-9ed2-3c2fc92a3911
-//  1895dd46-6f42-4a8d-89d7-1f19afacc6f4
-//  181ed54d-4593-406b-af3e-cf2ea0fd0ec2
-//  17fab680-dc9a-4cb8-ac83-fd4acd27ddb6
-
-// TODO: Verify the instructions in this recipe got inserted correctly
-//   064666b0-214e-4a88-882b-80da8e97743e
-//   0db2928e-abcc-4c63-b3c5-9b56b6b0c017
 
 import * as admin from "firebase-admin"
 import * as fs from "fs"
